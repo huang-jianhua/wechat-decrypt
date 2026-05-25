@@ -158,6 +158,60 @@ python find_image_key.py
 
 > **注意**: AES 密钥仅在微信查看图片时临时加载到内存中。如果扫描未找到密钥，请先在微信中查看几张图片，然后立即重新运行脚本。
 
+## running-bot 消息推送
+
+将监听到的微信消息标准化后，通过 HTTP 推送到本机 [running-bot](http://127.0.0.1:18765) 的 ingress 接口。**仅做信息入口**，不调用 Outbox、不发送微信、不处理跑团业务。
+
+### 配置项（`config.json`）
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `enable_running_bot_push` | 是否开启推送 | `true` |
+| `running_bot_ingress_url` | ingress 地址 | `http://127.0.0.1:18765/api/ingress/wechat/message` |
+| `running_bot_push_timeout_seconds` | HTTP 超时（秒） | `5` |
+| `running_bot_push_retry_count` | 失败重试次数 | `2` |
+| `running_bot_group_whitelist` | 群聊白名单（群名/wxid 模糊匹配） | `["跑团机器人测试"]` |
+| `running_bot_user_whitelist` | 私聊白名单（昵称/wxid 模糊匹配） | `[]` |
+| `running_bot_name` | 机器人昵称（用于识别 @） | `""` |
+| `running_bot_aliases` | 机器人别名列表 | `[]` |
+
+本阶段默认**仅推送群「跑团机器人测试」**；私聊需往 `running_bot_user_whitelist` 添加联系人。
+
+### 字段映射（摘要）
+
+| ingress 字段 | 来源 |
+|--------------|------|
+| `chat.id` | 微信 `username`（群为 `xxx@chatroom`） |
+| `chat.name` | 联系人备注/群名 |
+| `chat.type` | 群 `group` / 私聊 `private` |
+| `sender.id` | 群：发送者 wxid；私聊：对方 wxid |
+| `message.id` | `username:timestamp:local_id` 或 hash 回退 |
+| `event_id` / `delivery.dedupe_key` | `wechat:{chat.id}:{message.id}` |
+| `message.images[].local_path` | 解密后 `decoded_images/` 绝对路径 |
+
+### 日志
+
+推送时控制台输出一行，例如：
+
+```
+[running-bot-push] trace_id=... event_id=wechat:...@chatroom:... push_status=success response_status=200 ...
+```
+
+### 本地验证
+
+1. 启动 running-bot HTTP Gateway（端口 18765）。
+2. `python main.py`，在群「跑团机器人测试」发：文字、@机器人、图片、引用。
+3. 在其他群/私聊发消息，应**不**出现 `push_status=success`（未命中白名单）。
+4. 查看 running-bot ingress 是否收到 JSON（无需验证 Outbox）。
+
+### 已知限制
+
+- `message.mentions` 暂未解析，固定 `[]`
+- `message.is_at_bot` 仅文本 `@昵称` 匹配
+- `quote.message_id` 常为空
+- 无 `local_id` 时 `message.id` 可能因秒级时间戳碰撞而不稳
+- `images.url` 不提供；V2 图片解密失败时 `push_status=partial`
+
 ## 文件说明
 
 | 文件 | 说明 |
@@ -169,7 +223,8 @@ python find_image_key.py
 | `find_all_keys_linux.py` | Linux 版内存扫描提 key |
 | `decrypt_db.py` | 全量解密所有数据库 |
 | `mcp_server.py` | MCP Server，让 Claude AI 查询微信数据 |
-| `monitor_web.py` | 实时消息监听 (Web UI + SSE + 图片预览) |
+| `monitor_web.py` | 实时消息监听 (Web UI + SSE + 图片预览 + running-bot 推送) |
+| `running_bot_push.py` | running-bot ingress HTTP 推送模块 |
 | `monitor.py` | 实时消息监听 (命令行) |
 | `decode_image.py` | 图片 .dat 文件解密模块 (XOR / V1 / V2) |
 | `find_image_key.py` | 从微信进程内存提取图片 AES 密钥 |

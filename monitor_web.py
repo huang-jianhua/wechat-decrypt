@@ -30,6 +30,7 @@ WAL_HEADER_SZ = 32
 WAL_FRAME_HEADER_SZ = 24
 
 from config import load_config
+from running_bot_push import init_pusher, get_pusher, schedule_push, should_defer_push
 _cfg = load_config()
 DB_DIR = _cfg["db_dir"]
 KEYS_FILE = _cfg["keys_file"]
@@ -737,10 +738,13 @@ class SessionMonitor:
                         'username': username,
                         'v2_unsupported': True,
                     })
+                    if get_pusher():
+                        schedule_push(self, msg_data, partial=True)
                     return
                 elif img_name:
                     image_url = f'/img/{img_name}'
                     msg_data['image_url'] = image_url
+                    msg_data['image_local_name'] = img_name
                     broadcast_sse({
                         'event': 'image_update',
                         'timestamp': timestamp,
@@ -748,6 +752,8 @@ class SessionMonitor:
                         'image_url': image_url,
                     })
                     print(f"  [img] 异步解密成功: {img_name}", flush=True)
+                    if get_pusher():
+                        schedule_push(self, msg_data)
                     return
                 elif attempt < 2:
                     time.sleep(delays[attempt])
@@ -755,6 +761,8 @@ class SessionMonitor:
                 print(f"  [img] 异步解密失败(attempt={attempt}): {e}", flush=True)
                 if attempt < 2:
                     time.sleep(delays[attempt])
+        if get_pusher():
+            schedule_push(self, msg_data, partial=True)
 
     def _fresh_decrypt_query(self, db_key, table_name, prev_ts, curr_ts):
         """独立解密 message DB 到临时文件并查询，避免共享缓存竞态"""
@@ -891,6 +899,9 @@ class SessionMonitor:
                 'username': username,
                 'is_group': is_group,
                 'sender': sender,
+                'sender_wxid': '',
+                'sender_display_name': '',
+                'msg_type_raw': base,
             }
             if base == 3:
                 # 隐藏的图片消息
@@ -913,7 +924,7 @@ class SessionMonitor:
                 print(f"  [hidden] 补充文字: {mc[:30]} t={ts}", flush=True)
             elif base == 47:
                 # 隐藏的表情消息
-                rich = self.resolve_rich_content(username, ts, 47)
+                rich = self._parse_rich_content(username, ts, 47)
                 msg_data.update({
                     'type': '表情', 'type_icon': '\U0001f600',
                     'content': '[表情]',
@@ -923,7 +934,7 @@ class SessionMonitor:
                 print(f"  [hidden] 补充表情 t={ts}", flush=True)
             elif base == 49:
                 # 隐藏的富媒体消息
-                rich = self.resolve_rich_content(username, ts, 49)
+                rich = self._parse_rich_content(username, ts, 49)
                 msg_data.update({
                     'type': format_msg_type(base), 'type_icon': msg_type_icon(base),
                     'content': mc[:100] if mc else '',
@@ -944,6 +955,14 @@ class SessionMonitor:
                 if len(messages_log) > MAX_LOG:
                     messages_log = messages_log[-MAX_LOG:]
             broadcast_sse(msg_data)
+            if get_pusher():
+                defer = should_defer_push(base)
+                if defer == 'image' and msg_data.get('image_url'):
+                    schedule_push(self, msg_data)
+                elif defer == 'rich' and (msg_data.get('rich') or msg_data.get('rich_content')):
+                    schedule_push(self, msg_data)
+                elif not defer:
+                    schedule_push(self, msg_data)
 
     def _query_msg_content(self, username, timestamp, base_type):
         """通用: 从 message_*.db 查找指定类型消息的 XML 内容
@@ -1215,10 +1234,14 @@ class SessionMonitor:
                         'rich': info,
                     })
                     print(f"  [rich] {info['type']} 解析成功", flush=True)
+                    if get_pusher():
+                        schedule_push(self, msg_data)
                     return
             except Exception as e:
                 print(f"  [rich] 解析失败: {e}", flush=True)
         print(f"  [rich] type={msg_type} 3次重试均失败: {username}", flush=True)
+        if get_pusher():
+            schedule_push(self, msg_data, partial=True)
 
     def query_state(self):
         """查询已解密副本的session状态"""
@@ -1295,6 +1318,9 @@ class SessionMonitor:
                     'username': username,
                     'is_group': is_group,
                     'sender': sender,
+                    'sender_wxid': curr['sender'] if is_group else '',
+                    'sender_display_name': curr['sender_name'] if is_group else '',
+                    'msg_type_raw': curr['msg_type'],
                     'type': format_msg_type(curr['msg_type']),
                     'type_icon': msg_type_icon(curr['msg_type']),
                     'content': summary,
@@ -1339,6 +1365,9 @@ class SessionMonitor:
                     messages_log = messages_log[-MAX_LOG:]
 
             broadcast_sse(msg)
+
+            if get_pusher() and not should_defer_push(msg.get('msg_type_raw', 0)):
+                schedule_push(self, msg)
 
             try:
                 now = time.time()
@@ -1896,6 +1925,8 @@ def main():
     print("加载联系人...", flush=True)
     contact_names = load_contact_names()
     print(f"已加载 {len(contact_names)} 个联系人", flush=True)
+
+    init_pusher(_cfg, contact_names)
 
     print("构建 username→DB 映射...", flush=True)
     username_db_map = build_username_db_map()

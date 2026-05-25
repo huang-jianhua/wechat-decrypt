@@ -29,6 +29,15 @@ _DEFAULT = {
     "decrypted_dir": "decrypted",
     "decoded_image_dir": "decoded_images",
     "wechat_process": _DEFAULT_PROCESS,
+    # running-bot 消息推送（默认仅推「跑团机器人测试」群）
+    "enable_running_bot_push": True,
+    "running_bot_ingress_url": "http://127.0.0.1:18765/api/ingress/wechat/message",
+    "running_bot_push_timeout_seconds": 5,
+    "running_bot_push_retry_count": 2,
+    "running_bot_group_whitelist": ["跑团机器人测试"],
+    "running_bot_user_whitelist": [],
+    "running_bot_name": "",
+    "running_bot_aliases": [],
 }
 
 
@@ -169,7 +178,7 @@ def load_config():
     cfg = {}
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE) as f:
+            with open(CONFIG_FILE, encoding='utf-8') as f:
                 cfg = json.load(f)
         except json.JSONDecodeError:
             print(f"[!] {CONFIG_FILE} 格式损坏，将使用默认配置")
@@ -181,12 +190,12 @@ def load_config():
         if detected:
             print(f"[+] 自动检测到微信数据目录: {detected}")
             cfg = {**_DEFAULT, **cfg, "db_dir": detected}
-            with open(CONFIG_FILE, "w") as f:
+            with open(CONFIG_FILE, "w", encoding='utf-8') as f:
                 json.dump(cfg, f, indent=4, ensure_ascii=False)
             print(f"[+] 已保存到: {CONFIG_FILE}")
         else:
             if not os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, "w") as f:
+                with open(CONFIG_FILE, "w", encoding='utf-8') as f:
                     json.dump(_DEFAULT, f, indent=4, ensure_ascii=False)
             print(f"[!] 未能自动检测微信数据目录")
             print(f"    请手动编辑 {CONFIG_FILE} 中的 db_dir 字段")
