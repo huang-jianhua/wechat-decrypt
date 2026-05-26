@@ -15,11 +15,14 @@ from socketserver import ThreadingMixIn
 from Crypto.Cipher import AES
 import urllib.parse
 import glob as glob_mod
-import zstandard as zstd
+try:
+    import zstandard as zstd  # type: ignore[reportMissingImports]
+except ImportError:
+    zstd = None
 from decode_image import extract_md5_from_packed_info, decrypt_dat_file, is_v2_format
 from key_utils import get_key_info, strip_key_metadata
 
-_zstd_dctx = zstd.ZstdDecompressor()
+_zstd_dctx = zstd.ZstdDecompressor() if zstd else None
 
 PAGE_SZ = 4096
 KEY_SZ = 32
@@ -30,7 +33,17 @@ WAL_HEADER_SZ = 32
 WAL_FRAME_HEADER_SZ = 24
 
 from config import load_config
-from running_bot_push import init_pusher, get_pusher, schedule_push, should_defer_push
+from running_bot_push import (
+    build_msg_data_from_db_row,
+    init_pusher,
+    get_pusher,
+    schedule_push,
+    should_defer_push,
+    should_push,
+    _base_msg_type,
+    _build_images,
+    _SKIP_BASE_TYPES,
+)
 _cfg = load_config()
 DB_DIR = _cfg["db_dir"]
 KEYS_FILE = _cfg["keys_file"]
@@ -482,6 +495,389 @@ def broadcast_sse(msg_data):
             sse_clients.remove(q)
 
 
+class RunningBotReliableScanner:
+    """Reliable running-bot source: scan message DB rows by local_id."""
+
+    def __init__(self, db_cache, username_db_map, contact_names):
+        self.db_cache = db_cache
+        self.username_db_map = username_db_map
+        self.contact_names = contact_names
+        self.scan_delay = float(_cfg.get("running_bot_scan_delay_seconds", 3))
+        self.reconcile_interval = float(_cfg.get("running_bot_reconcile_interval_seconds", 30))
+        self.overlap_seconds = int(_cfg.get("running_bot_scan_overlap_seconds", 10))
+        self._pending = {}
+        self._pending_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name='rb-reliable-scan', daemon=True)
+        self._watermarks = {}
+        self._seen = set()
+        self._state_db = ''
+        pusher = get_pusher()
+        if pusher and pusher.config.outbox_db:
+            self._state_db = pusher.config.outbox_db
+
+    def start(self):
+        self._init_state_db()
+        self._load_watermarks()
+        self._prime_watermarks()
+        self._thread.start()
+        print(
+            f"[running-bot-reliable] 已启用 scan_delay={self.scan_delay}s "
+            f"reconcile={self.reconcile_interval}s overlap={self.overlap_seconds}s",
+            flush=True,
+        )
+
+    def mark_chat(self, username):
+        if not username:
+            return
+        with self._pending_lock:
+            self._pending[username] = time.time() + self.scan_delay
+
+    def _connect_state(self):
+        if not self._state_db:
+            return None
+        conn = sqlite3.connect(self._state_db, timeout=30)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA busy_timeout=30000')
+        return conn
+
+    def _init_state_db(self):
+        conn = self._connect_state()
+        if not conn:
+            return
+        try:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS running_bot_scan_state (
+                  username TEXT NOT NULL,
+                  db_key TEXT NOT NULL,
+                  last_create_time INTEGER NOT NULL,
+                  last_local_id INTEGER NOT NULL,
+                  updated_at REAL NOT NULL,
+                  PRIMARY KEY (username, db_key)
+                )
+            ''')
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _load_watermarks(self):
+        conn = self._connect_state()
+        if not conn:
+            return
+        try:
+            rows = conn.execute(
+                'SELECT username, db_key, last_create_time, last_local_id FROM running_bot_scan_state'
+            ).fetchall()
+            for username, db_key, ts, local_id in rows:
+                self._watermarks[(username, db_key)] = (int(ts), int(local_id))
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
+
+    def _save_watermark(self, username, db_key, watermark):
+        conn = self._connect_state()
+        if not conn:
+            return
+        try:
+            conn.execute('''
+                INSERT INTO running_bot_scan_state
+                (username, db_key, last_create_time, last_local_id, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(username, db_key) DO UPDATE SET
+                  last_create_time=excluded.last_create_time,
+                  last_local_id=excluded.last_local_id,
+                  updated_at=excluded.updated_at
+            ''', (username, db_key, int(watermark[0]), int(watermark[1]), time.time()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _target_usernames(self):
+        pusher = get_pusher()
+        if not pusher:
+            return []
+        targets = []
+        for username in self.username_db_map:
+            is_group = '@chatroom' in username
+            display = self.contact_names.get(username, username)
+            if should_push(pusher.config, username, display, is_group):
+                targets.append(username)
+        return targets
+
+    def _prime_watermarks(self):
+        for username in self._target_usernames():
+            table_name = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
+            for db_key in self.username_db_map.get(username, []):
+                if (username, db_key) in self._watermarks:
+                    continue
+                dec_path = self.db_cache.get(db_key) if self.db_cache else None
+                if not dec_path:
+                    continue
+                try:
+                    conn = sqlite3.connect(f"file:{dec_path}?mode=ro", uri=True)
+                    row = conn.execute(f'''
+                        SELECT create_time, local_id FROM "{table_name}"
+                        ORDER BY create_time DESC, local_id DESC LIMIT 1
+                    ''').fetchone()
+                    conn.close()
+                    if row:
+                        self._watermarks[(username, db_key)] = (int(row[0]), int(row[1]))
+                except Exception:
+                    continue
+        print(f"[running-bot-reliable] 初始化游标 {len(self._watermarks)} 个", flush=True)
+
+    def _due_chats(self):
+        now = time.time()
+        due = []
+        with self._pending_lock:
+            for username, due_at in list(self._pending.items()):
+                if due_at <= now:
+                    due.append(username)
+                    self._pending.pop(username, None)
+        return due
+
+    def _run(self):
+        next_reconcile = time.time() + self.reconcile_interval
+        while not self._stop.is_set():
+            due = self._due_chats()
+            now = time.time()
+            if now >= next_reconcile:
+                due.extend(self._target_usernames())
+                next_reconcile = now + self.reconcile_interval
+            for username in dict.fromkeys(due):
+                try:
+                    self.scan_chat(username)
+                except Exception as e:
+                    print(f"[running-bot-reliable] 扫描失败 {username}: {e}", flush=True)
+            self._stop.wait(0.5)
+
+    def scan_chat(self, username):
+        pusher = get_pusher()
+        if not pusher:
+            return
+        display = self.contact_names.get(username, username)
+        is_group = '@chatroom' in username
+        if not should_push(pusher.config, username, display, is_group):
+            return
+
+        table_name = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
+        emitted = 0
+        for db_key in self.username_db_map.get(username, []):
+            dec_path = self.db_cache.get(db_key) if self.db_cache else None
+            if not dec_path:
+                continue
+            watermark = self._watermarks.get((username, db_key), (0, 0))
+            from_ts = max(0, watermark[0] - self.overlap_seconds)
+            try:
+                conn = sqlite3.connect(f"file:{dec_path}?mode=ro", uri=True)
+                rows = conn.execute(f'''
+                    SELECT local_id, local_type, create_time, real_sender_id,
+                           message_content, WCDB_CT_message_content
+                    FROM "{table_name}"
+                    WHERE create_time >= ?
+                    ORDER BY create_time ASC, local_id ASC
+                ''', (from_ts,)).fetchall()
+                name2id = self._load_name2id(conn)
+                conn.close()
+            except Exception as e:
+                if 'no such table' not in str(e):
+                    print(f"[running-bot-reliable] 查询失败 {db_key}/{username}: {e}", flush=True)
+                continue
+
+            max_seen = watermark
+            for local_id, local_type, create_time, real_sender_id, mc, ct_flag in rows:
+                local_id = int(local_id)
+                create_time = int(create_time)
+                if (create_time, local_id) <= watermark:
+                    continue
+                base = _base_msg_type(local_type)
+                if base in _SKIP_BASE_TYPES:
+                    max_seen = max(max_seen, (create_time, local_id))
+                    continue
+                unique = (username, db_key, local_id)
+                if unique in self._seen:
+                    max_seen = max(max_seen, (create_time, local_id))
+                    continue
+                msg_data = build_msg_data_from_db_row(
+                    username=username,
+                    chat_display=display,
+                    db_key=db_key,
+                    local_id=local_id,
+                    local_type=local_type,
+                    create_time=create_time,
+                    real_sender_id=real_sender_id,
+                    message_content=mc,
+                    ct_flag=ct_flag,
+                    name2id=name2id,
+                    contact_names=self.contact_names,
+                )
+                if base == 49:
+                    rich = self._parse_rich_from_content(msg_data.get('raw_content', ''), local_type)
+                    if rich:
+                        msg_data['rich'] = rich
+                if base == 3:
+                    img_name = self._resolve_image_by_local_id(username, db_key, local_id, create_time)
+                    if img_name is None:
+                        continue
+                    if img_name == '__v2_unsupported__':
+                        msg_data['content'] = '[图片 - 新加密格式暂不支持预览]'
+                        msg_data['_allow_empty_image'] = True
+                    else:
+                        msg_data['image_url'] = f'/img/{img_name}'
+                        msg_data['image_local_name'] = img_name
+                        if not _build_images(msg_data, pusher.config.decoded_image_dir):
+                            continue
+                self._seen.add(unique)
+                schedule_push(self, msg_data, partial=False, from_reliable_scanner=True)
+                emitted += 1
+                max_seen = max(max_seen, (create_time, local_id))
+            self._watermarks[(username, db_key)] = max_seen
+            self._save_watermark(username, db_key, max_seen)
+        if emitted:
+            print(f"[running-bot-reliable] {display} 入队 {emitted} 条", flush=True)
+
+    def _load_name2id(self, conn):
+        try:
+            return {rowid: user_name for rowid, user_name in conn.execute(
+                "SELECT rowid, user_name FROM Name2Id"
+            ).fetchall() if user_name}
+        except sqlite3.Error:
+            return {}
+
+    def _resolve_image_by_local_id(self, username, db_key, local_id, create_time):
+        if not self.db_cache:
+            return None
+
+        file_md5 = None
+        res_key = os.path.join("message", "message_resource.db")
+        for _try in range(2):
+            res_path = self.db_cache.get(res_key)
+            if not res_path:
+                return None
+            try:
+                conn = sqlite3.connect(f"file:{res_path}?mode=ro", uri=True)
+                row = conn.execute(
+                    "SELECT packed_info FROM MessageResourceInfo "
+                    "WHERE message_local_id = ? AND message_create_time = ? "
+                    "AND (message_local_type = 3 OR message_local_type % 4294967296 = 3)",
+                    (local_id, create_time),
+                ).fetchone()
+                conn.close()
+                if row and row[0]:
+                    file_md5 = extract_md5_from_packed_info(row[0])
+                break
+            except Exception as e:
+                if 'malformed' in str(e) and _try == 0:
+                    self.db_cache.invalidate(res_key)
+                    continue
+                print(f"  [running-bot-reliable] 图片资源查询失败 local_id={local_id}: {e}", flush=True)
+                return None
+
+        if not file_md5:
+            print(f"  [running-bot-reliable] 图片缺少MD5 local_id={local_id} t={create_time}", flush=True)
+            return None
+
+        return self._decode_image_by_md5(username, file_md5)
+
+    def _decode_image_by_md5(self, username, file_md5):
+        attach_dir = os.path.join(WECHAT_BASE_DIR, "msg", "attach")
+        username_hash = hashlib.md5(username.encode()).hexdigest()
+        search_base = os.path.join(attach_dir, username_hash)
+        if not os.path.isdir(search_base):
+            return None
+
+        pattern = os.path.join(search_base, "*", "Img", f"{file_md5}*.dat")
+        dat_files = sorted(glob_mod.glob(pattern))
+        if not dat_files:
+            return None
+
+        ranked = []
+        for f in dat_files:
+            fname = os.path.basename(f).lower()
+            sz = os.path.getsize(f)
+            if '_t_' in fname:
+                rank = 5
+            elif '_t.' in fname:
+                rank = 4
+            elif '_w.' in fname:
+                rank = 2
+            elif '_h.' in fname:
+                rank = 1
+            else:
+                rank = 0
+            ranked.append((rank, sz, f))
+        ranked.sort(key=lambda x: (x[0], -x[1]))
+
+        os.makedirs(DECODED_IMAGE_DIR, exist_ok=True)
+        out_base = os.path.join(DECODED_IMAGE_DIR, file_md5)
+        for ext in ('jpg', 'png', 'webp'):
+            candidate = f"{out_base}.{ext}"
+            if os.path.exists(candidate):
+                return os.path.basename(candidate)
+
+        for _rank, _sz, selected in ranked:
+            if is_v2_format(selected) and not IMAGE_AES_KEY:
+                continue
+            result_path, fmt = decrypt_dat_file(selected, f"{out_base}.tmp", IMAGE_AES_KEY, IMAGE_XOR_KEY)
+            if not result_path:
+                continue
+            if fmt in ('hevc', 'bin'):
+                jpg_path = _convert_hevc_to_jpeg(result_path, f"{out_base}.jpg")
+                os.unlink(result_path)
+                if jpg_path:
+                    return os.path.basename(jpg_path)
+                continue
+            if fmt not in ('jpg', 'png', 'webp'):
+                try:
+                    os.unlink(result_path)
+                except OSError:
+                    pass
+                continue
+            final = f"{out_base}.{fmt}"
+            if os.path.exists(final):
+                os.unlink(final)
+            os.rename(result_path, final)
+            return os.path.basename(final)
+        return '__v2_unsupported__'
+
+    def _parse_rich_from_content(self, mc, local_type):
+        if not mc or '<appmsg' not in mc:
+            return None
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(mc)
+            appmsg = root.find('.//appmsg')
+            if appmsg is None:
+                return None
+            title = (appmsg.findtext('title') or '').strip()
+            des = (appmsg.findtext('des') or '').strip()
+            url = (appmsg.findtext('url') or '').strip().replace('&amp;', '&')
+            sub_type = int(local_type) >> 32 if int(local_type) > 4294967296 else 0
+            app_type = int(appmsg.findtext('type') or sub_type or 0)
+            if app_type == 57:
+                ref = appmsg.find('.//refermsg')
+                return {
+                    'type': 'quote',
+                    'title': title,
+                    'ref_name': ref.findtext('displayname') if ref is not None else '',
+                    'ref_content': (ref.findtext('content') if ref is not None else '') or '',
+                }
+            if app_type == 6:
+                attach = appmsg.find('.//appattach')
+                return {
+                    'type': 'file',
+                    'title': title,
+                    'file_ext': (attach.findtext('fileext') or '') if attach is not None else '',
+                    'file_size': int(attach.findtext('totallen') or 0) if attach is not None else 0,
+                }
+            if title or url:
+                return {'type': 'link', 'title': title, 'des': des[:200], 'url': url}
+        except Exception:
+            return None
+        return None
+
+
 def _convert_hevc_to_jpeg(hevc_path, jpeg_path):
     """将 wxgf/HEVC 文件转为 JPEG
 
@@ -875,7 +1271,7 @@ class SessionMonitor:
             if (username, ts, base) in self._shown_keys:
                 continue
             # 解压 zstd
-            if isinstance(mc, bytes) and ct == 4:
+            if isinstance(mc, bytes) and ct == 4 and _zstd_dctx:
                 try:
                     mc = _zstd_dctx.decompress(mc).decode('utf-8', errors='replace')
                 except Exception:
@@ -956,13 +1352,15 @@ class SessionMonitor:
                     messages_log = messages_log[-MAX_LOG:]
             broadcast_sse(msg_data)
             if get_pusher():
-                defer = should_defer_push(base)
-                if defer == 'image' and msg_data.get('image_url'):
-                    schedule_push(self, msg_data)
-                elif defer == 'rich' and (msg_data.get('rich') or msg_data.get('rich_content')):
-                    schedule_push(self, msg_data)
-                elif not defer:
-                    schedule_push(self, msg_data)
+                pusher = get_pusher()
+                if pusher and not pusher.config.reliable_mode:
+                    defer = should_defer_push(base)
+                    if defer == 'image' and msg_data.get('image_url'):
+                        schedule_push(self, msg_data)
+                    elif defer == 'rich' and (msg_data.get('rich') or msg_data.get('rich_content')):
+                        schedule_push(self, msg_data)
+                    elif not defer:
+                        schedule_push(self, msg_data)
 
     def _query_msg_content(self, username, timestamp, base_type):
         """通用: 从 message_*.db 查找指定类型消息的 XML 内容
@@ -994,7 +1392,7 @@ class SessionMonitor:
                     if not row:
                         break  # 表存在但没找到匹配行，换下一个 DB
                     mc, ct_flag, full_type = row
-                    if isinstance(mc, bytes) and ct_flag == 4:
+                    if isinstance(mc, bytes) and ct_flag == 4 and _zstd_dctx:
                         mc = _zstd_dctx.decompress(mc).decode('utf-8', errors='replace')
                     elif isinstance(mc, bytes):
                         mc = mc.decode('utf-8', errors='replace')
@@ -1275,7 +1673,7 @@ class SessionMonitor:
         self.patched_pages = pages + wal_patched
         return self.patched_pages
 
-    def check_updates(self):
+    def check_updates(self, reliable_scanner=None):
         global messages_log
         try:
             t0 = time.perf_counter()
@@ -1303,7 +1701,7 @@ class SessionMonitor:
                     sender = self.contact_names.get(curr['sender'], curr['sender_name'] or curr['sender'])
 
                 summary = curr['summary']
-                if isinstance(summary, bytes):
+                if isinstance(summary, bytes) and _zstd_dctx:
                     try:
                         summary = _zstd_dctx.decompress(summary).decode('utf-8', errors='replace')
                     except Exception:
@@ -1354,6 +1752,8 @@ class SessionMonitor:
                     username, prev_ts, curr['timestamp'], curr['msg_type'],
                     display, is_group, sender
                 )
+                if reliable_scanner:
+                    reliable_scanner.mark_chat(username)
 
         # 按时间排序
         new_msgs.sort(key=lambda m: m['timestamp'])
@@ -1366,7 +1766,10 @@ class SessionMonitor:
 
             broadcast_sse(msg)
 
-            if get_pusher() and not should_defer_push(msg.get('msg_type_raw', 0)):
+            pusher = get_pusher()
+            if pusher and pusher.config.reliable_mode:
+                pass
+            elif pusher and not should_defer_push(msg.get('msg_type_raw', 0)):
                 schedule_push(self, msg)
 
             try:
@@ -1388,7 +1791,7 @@ class SessionMonitor:
         cutoff = int(time.time()) - 300
         self._shown_keys = {k for k in self._shown_keys if k[1] > cutoff}
 
-def monitor_thread(enc_key, session_db, contact_names, db_cache=None, username_db_map=None):
+def monitor_thread(enc_key, session_db, contact_names, db_cache=None, username_db_map=None, reliable_scanner=None):
     mon = SessionMonitor(enc_key, session_db, contact_names, db_cache, username_db_map)
     wal_path = mon.wal_path
 
@@ -1428,7 +1831,7 @@ def monitor_thread(enc_key, session_db, contact_names, db_cache=None, username_d
             wal_changed = wal_mtime != prev_wal_mtime
             db_changed = db_mtime != prev_db_mtime
 
-            mon.check_updates()
+            mon.check_updates(reliable_scanner)
 
             t_done = time.perf_counter()
             try:
@@ -1973,7 +2376,17 @@ def main():
         print(f"[warmup] 全部完成 {(time.perf_counter()-t0)*1000:.0f}ms", flush=True)
     threading.Thread(target=_warmup, daemon=True).start()
 
-    t = threading.Thread(target=monitor_thread, args=(enc_key, session_db, contact_names, db_cache, username_db_map), daemon=True)
+    reliable_scanner = None
+    pusher = get_pusher()
+    if pusher and pusher.config.reliable_mode:
+        reliable_scanner = RunningBotReliableScanner(db_cache, username_db_map, contact_names)
+        reliable_scanner.start()
+
+    t = threading.Thread(
+        target=monitor_thread,
+        args=(enc_key, session_db, contact_names, db_cache, username_db_map, reliable_scanner),
+        daemon=True,
+    )
     t.start()
 
     server = ThreadedServer(('0.0.0.0', PORT), Handler)

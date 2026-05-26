@@ -38,6 +38,12 @@ _DEFAULT = {
     "running_bot_user_whitelist": [],
     "running_bot_name": "",
     "running_bot_aliases": [],
+    "running_bot_reliable_mode": True,
+    "running_bot_scan_delay_seconds": 3,
+    "running_bot_reconcile_interval_seconds": 30,
+    "running_bot_scan_overlap_seconds": 10,
+    "running_bot_outbox_db": "decrypted/_monitor_cache/running_bot_outbox.db",
+    "running_bot_outbox_batch_size": 20,
 }
 
 
@@ -209,7 +215,7 @@ def load_config():
 
     # 将相对路径转为绝对路径
     base = os.path.dirname(os.path.abspath(__file__))
-    for key in ("keys_file", "decrypted_dir", "decoded_image_dir"):
+    for key in ("keys_file", "decrypted_dir", "decoded_image_dir", "running_bot_outbox_db"):
         if key in cfg and not os.path.isabs(cfg[key]):
             cfg[key] = os.path.join(base, cfg[key])
 
