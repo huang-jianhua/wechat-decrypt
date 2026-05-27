@@ -1642,7 +1642,24 @@ class RunningBotPusher:
             and not images
             and not msg_data.get('_allow_empty_image')
         ):
-            return
+            has_image_ref = bool(
+                msg_data.get('image_local_name')
+                or msg_data.get('image_url')
+            )
+            if not has_image_ref:
+                return
+            partial = True
+            placeholder = '[图片 - 解码文件暂不可用]'
+            if not (payload['message'].get('text') or '').strip():
+                payload['message']['text'] = placeholder
+            if not (payload['message'].get('raw_text') or '').strip():
+                payload['message']['raw_text'] = payload['message'].get('text') or placeholder
+            print(
+                '  [running-bot-push] 图片解码文件缺失，best-effort partial push '
+                f'local_id={msg_data.get("local_id")} '
+                f'image={msg_data.get("image_local_name") or msg_data.get("image_url")}',
+                flush=True,
+            )
         _log_quote_image_without_media(
             payload, local_id=msg_data.get('local_id'),
         )

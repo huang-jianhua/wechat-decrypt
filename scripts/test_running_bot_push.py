@@ -547,8 +547,36 @@ class RunningBotReliableTests(unittest.TestCase):
             self.assertEqual(attempts, 3)
 
     @patch("running_bot_push.push_with_retry")
-    def test_try_push_skips_empty_image_in_reliable_mode(self, mock_push):
+    def test_try_push_defers_image_without_ref_in_reliable_mode(self, mock_push):
         mock_push.return_value = ('success', 200, None, 0, {})
+        with tempfile.TemporaryDirectory() as td:
+            cfg = RunningBotPushConfig(
+                group_whitelist=["跑团机器人测试"],
+                decoded_image_dir=td,
+                reliable_mode=True,
+                outbox_db="",
+            )
+            contact_names = {"test@chatroom": "跑团机器人测试", "wxid_user": "淇淇"}
+            pusher = RunningBotPusher(cfg, contact_names)
+            msg_data = build_msg_data_from_db_row(
+                username="test@chatroom",
+                chat_display="跑团机器人测试",
+                db_key="message/message_0.db",
+                local_id=99,
+                local_type=3,
+                create_time=999,
+                real_sender_id=1,
+                message_content="",
+                ct_flag=0,
+                name2id={1: "wxid_user"},
+                contact_names=contact_names,
+            )
+            pusher.try_push(MagicMock(), msg_data)
+            mock_push.assert_not_called()
+
+    @patch("running_bot_push.push_with_retry")
+    def test_try_push_best_effort_partial_when_image_file_missing(self, mock_push):
+        mock_push.return_value = ('success', 200, None, 0, {'accepted': True})
         with tempfile.TemporaryDirectory() as td:
             cfg = RunningBotPushConfig(
                 group_whitelist=["跑团机器人测试"],
@@ -573,7 +601,11 @@ class RunningBotReliableTests(unittest.TestCase):
             )
             msg_data["image_local_name"] = "missing.jpg"
             pusher.try_push(MagicMock(), msg_data)
-            mock_push.assert_not_called()
+            mock_push.assert_called_once()
+            payload = mock_push.call_args[0][0]
+            self.assertEqual(payload["message"]["type"], "image")
+            self.assertEqual(payload["message"]["images"], [])
+            self.assertIn("解码文件暂不可用", payload["message"]["text"])
 
     @patch("running_bot_push.push_with_retry")
     def test_try_push_allows_partial_image_with_allow_empty_flag(self, mock_push):
