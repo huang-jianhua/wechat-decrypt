@@ -575,6 +575,40 @@ class RunningBotReliableTests(unittest.TestCase):
             pusher.try_push(MagicMock(), msg_data)
             mock_push.assert_not_called()
 
+    @patch("running_bot_push.push_with_retry")
+    def test_try_push_allows_partial_image_with_allow_empty_flag(self, mock_push):
+        mock_push.return_value = ('success', 200, None, 0, {'accepted': True})
+        with tempfile.TemporaryDirectory() as td:
+            cfg = RunningBotPushConfig(
+                group_whitelist=["跑团机器人测试"],
+                decoded_image_dir=td,
+                reliable_mode=True,
+                outbox_db="",
+            )
+            contact_names = {"test@chatroom": "跑团机器人测试", "wxid_user": "淇淇"}
+            pusher = RunningBotPusher(cfg, contact_names)
+            msg_data = build_msg_data_from_db_row(
+                username="test@chatroom",
+                chat_display="跑团机器人测试",
+                db_key="message/message_0.db",
+                local_id=99,
+                local_type=3,
+                create_time=999,
+                real_sender_id=1,
+                message_content="",
+                ct_flag=0,
+                name2id={1: "wxid_user"},
+                contact_names=contact_names,
+            )
+            msg_data["image_local_name"] = "missing.jpg"
+            msg_data["_allow_empty_image"] = True
+            msg_data["content"] = "[图片 - 解码文件暂不可用]"
+            pusher.try_push(MagicMock(), msg_data, partial=True)
+            mock_push.assert_called_once()
+            payload = mock_push.call_args[0][0]
+            self.assertEqual(payload["message"]["type"], "image")
+            self.assertEqual(payload["message"]["images"], [])
+
     def test_decode_wcdb_text_plain_utf8_bytes(self):
         from running_bot_push import decode_wcdb_text
         text = 'hjhua_java:\n@跑团小助手 /补卡'

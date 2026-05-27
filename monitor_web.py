@@ -748,7 +748,10 @@ class RunningBotReliableScanner:
                         msg_data['image_url'] = f'/img/{img_name}'
                         msg_data['image_local_name'] = img_name
                         if not _build_images(msg_data, pusher.config.decoded_image_dir):
-                            continue
+                            msg_data['content'] = (
+                                msg_data.get('content') or '[图片 - 解码文件暂不可用]'
+                            )
+                            msg_data['_allow_empty_image'] = True
                 self._seen.add(unique)
                 schedule_push(self, msg_data, partial=False, from_reliable_scanner=True)
                 emitted += 1
