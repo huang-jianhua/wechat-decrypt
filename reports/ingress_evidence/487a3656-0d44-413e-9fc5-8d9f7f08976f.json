@@ -1,0 +1,44 @@
+{
+  "outbox_status": "delivered",
+  "outbox_attempts": 0,
+  "outbox_last_error": null,
+  "post_payload": {
+    "source": "wechat",
+    "adapter": "wechat-decryptor-local",
+    "event_id": "wechat:53006947615@chatroom:53006947615@chatroom:message/message_0.db:1235",
+    "trace_id": "487a3656-0d44-413e-9fc5-8d9f7f08976f",
+    "timestamp": "2026-05-26T18:07:44+08:00",
+    "chat": {
+      "id": "53006947615@chatroom",
+      "name": "跑团机器人测试",
+      "type": "group"
+    },
+    "sender": {
+      "id": "hjhua_java",
+      "name": "筋膜球",
+      "display_name": "筋膜球",
+      "is_self": false,
+      "is_admin": false
+    },
+    "message": {
+      "id": "53006947615@chatroom:message/message_0.db:1235",
+      "type": "text",
+      "text": "@跑团小助手 今天天气真好，你觉得呢",
+      "raw_text": "@跑团小助手 今天天气真好，你觉得呢",
+      "mentions": [
+        {
+          "name": "跑团小助手",
+          "is_bot": true
+        }
+      ],
+      "is_at_bot": true,
+      "quote": null,
+      "images": []
+    },
+    "delivery": {
+      "retry_count": 0,
+      "dedupe_key": "wechat:53006947615@chatroom:53006947615@chatroom:message/message_0.db:1235",
+      "received_at": "2026-05-26T18:07:16+08:00"
+    }
+  }
+}

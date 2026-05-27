@@ -7,7 +7,7 @@
 | 版本 | **wechat_ingress_v1** |
 | 正式入口 | **`POST /api/ingress/wechat/message`** |
 | 受众 | WeChat Decryptor 项目 / Decryptor AI 助手 |
-| Running Service 实现 | `message_bus/wechat_ingress_adapter.py`、`message_bus/gateway.py` |
+| Running Service 实现 | 仓库内参考 `wechat_ingress_adapter.py`；Running 部署路径 `message_bus/wechat_ingress_adapter.py`、`message_bus/gateway.py` |
 | 关联文档 | `project-docs/14_HTTP_INGRESS_INTERFACE_SPEC.md`、`project-docs/15_MEDIA_INLINE_BASE64_PLAN.md` |
 | 本地验证 | `reports/verification/phase4_media_inline_base64_2026-05-25-local.md` |
 
@@ -400,6 +400,27 @@ Gateway 解码 base64 → 落盘 media_store → 生成 media_ref
 
 管理员 `/撤销`、`/补卡` 等命令依赖引用正文。
 
+**标准（Running Service 与 Decryptor 共用，事实源即本文档 + `message_bus/wechat_ingress_adapter.py`）：**
+
+| 项 | 要求 |
+| --- | --- |
+| 正文 `text` | 含 `@跑团小助手` 与 `/撤销` 或 `/补卡`；若微信 UI 显示「引用文字」，可原样传入，Running 会剥离 |
+| `is_at_bot` 或 `mentions[]` | 至少一种为真，见 §7.1 |
+| `quote.text` | **必填**（或 `content`/`body`/`preview` 之一），须含机器人「已记录…」或「已为…补记…」全文及 `打卡ID` |
+| 预期群内回复 | **固定业务短句**，如 `已撤销 张三：5.30 公里。`；**不是** AI 闲聊、段子或角色扮演 |
+| `running_response.action_type` | 成功撤销应为 `admin_quote_undo`；**不应**为 `general_ai_reply` |
+
+### 7.1 @ 机器人字段（二选一或同时）
+
+```json
+"is_at_bot": true,
+"mentions": [{ "name": "跑团小助手", "is_bot": true }]
+```
+
+仅 UI 里 @ 但 JSON 未带 `mentions`/`is_at_bot` 时，管理员命令可能无法执行。
+
+### 7.2 引用撤销示例
+
 ```json
 "message": {
   "type": "text",
@@ -414,7 +435,7 @@ Gateway 解码 base64 → 落盘 media_store → 生成 media_ref
 }
 ```
 
-引用图片（`/补卡` 无距离重识别，B5+ 才计划支持 inline base64 quote）：
+引用图片（跨机 `/补卡` 无距离识图）应带 `quote.media`：
 
 ```json
 "quote": {
@@ -422,13 +443,19 @@ Gateway 解码 base64 → 落盘 media_store → 生成 media_ref
   "sender_name": "张三",
   "text": "",
   "type": "image",
-  "image_id": "wx_img_quote",
-  "local_path": "/only/for-same-machine-debug",
-  "url": "https://optional-url"
+  "image_id": "wx_img_<md5>",
+  "media": {
+    "transport": "inline_base64",
+    "content_base64": "<BASE64_WITHOUT_PREFIX>",
+    "mime_type": "image/jpeg",
+    "file_name": "<md5>.jpg",
+    "size_bytes": 245678,
+    "sha256": "a1b2c3..."
+  }
 }
 ```
 
-跨机 Decryptor 引用图片应优先规划 `quote.media.transport=inline_base64`（与主图相同结构）；当前 Running Service **尚未**完整验收该路径。
+Decryptor 从引用 XML 的 `refermsg/content` 提取图片 MD5，解密 `.dat` 后填入 `quote.media`（与主图相同结构）。Running Service 侧需开启对应验收路径。
 
 ---
 

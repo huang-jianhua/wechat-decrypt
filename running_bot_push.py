@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import base64
+import glob
 import json
 import os
 import re
 import sqlite3
 import threading
 import time
-import uuid
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -72,9 +72,29 @@ class RunningBotPushConfig:
     reliable_mode: bool = True
     outbox_db: str = ''
     outbox_batch_size: int = 20
+    outbox_max_attempts: int = 3
+    log_post_payload: bool = True
+    image_aes_key: bytes | str | None = None
+    image_xor_key: int = 0x88
 
     @classmethod
     def from_cfg(cls, cfg: dict) -> 'RunningBotPushConfig':
+        aes_key = cfg.get('image_aes_key') or None
+        if isinstance(aes_key, str) and aes_key:
+            stripped = aes_key.strip()
+            # 32 位 hex → 16 字节；否则按 ASCII 密钥原样交给 decrypt_dat_file（与 monitor 一致）
+            if len(stripped) == 32 and all(c in '0123456789abcdefABCDEF' for c in stripped):
+                try:
+                    aes_key = bytes.fromhex(stripped)
+                except ValueError:
+                    aes_key = stripped
+            else:
+                aes_key = stripped
+        xor_key = cfg.get('image_xor_key', 0x88)
+        try:
+            xor_key = int(xor_key)
+        except (TypeError, ValueError):
+            xor_key = 0x88
         return cls(
             enabled=bool(cfg.get('enable_running_bot_push', True)),
             ingress_url=str(cfg.get(
@@ -92,6 +112,10 @@ class RunningBotPushConfig:
             reliable_mode=bool(cfg.get('running_bot_reliable_mode', True)),
             outbox_db=str(cfg.get('running_bot_outbox_db') or ''),
             outbox_batch_size=int(cfg.get('running_bot_outbox_batch_size', 20)),
+            outbox_max_attempts=int(cfg.get('running_bot_outbox_max_attempts', 3)),
+            log_post_payload=bool(cfg.get('running_bot_log_post_payload', True)),
+            image_aes_key=aes_key,
+            image_xor_key=xor_key,
         )
 
 
@@ -146,19 +170,158 @@ def stable_event_id(chat_id: str, message_id: str) -> str:
     return f'wechat:{chat_id}:{message_id}'
 
 
-def detect_at_bot(raw_text: str, bot_name: str, aliases: list[str]) -> bool:
-    text = raw_text or ''
+def stable_trace_id(event_id: str) -> str:
+    """trace_id 与 event_id 稳定绑定；重试时不得更换。"""
+    return event_id
+
+
+def _bot_names(bot_name: str, aliases: list[str]) -> list[str]:
     names = []
     if bot_name:
-        names.append(bot_name)
-    names.extend(aliases or [])
-    for name in names:
-        n = (name or '').strip()
-        if not n:
-            continue
-        if re.search(r'@' + re.escape(n) + r'(?:\s|$|[\u200b\u2005])', text, re.IGNORECASE):
+        names.append(bot_name.strip())
+    for alias in aliases or []:
+        alias = (alias or '').strip()
+        if alias and alias not in names:
+            names.append(alias)
+    return names
+
+
+def _is_bot_mention(name: str, bot_name: str, aliases: list[str]) -> bool:
+    needle = (name or '').strip()
+    if not needle:
+        return False
+    for bot in _bot_names(bot_name, aliases):
+        if needle == bot or needle.lower() == bot.lower():
             return True
-        if f'@{n}' in text:
+    return False
+
+
+def _extract_xml_document(content: str) -> str:
+    """从群消息正文中截取 XML 片段（去掉 wxid: 前缀等）。"""
+    text = (content or '').strip()
+    if not text:
+        return ''
+    if ':\n' in text:
+        head, tail = text.split(':\n', 1)
+        if '<' not in head and ('<?xml' in tail or '<msg' in tail or '<appmsg' in tail):
+            text = tail.strip()
+    for marker in ('<?xml', '<msg', '<appmsg'):
+        idx = text.find(marker)
+        if idx >= 0:
+            return text[idx:]
+    return text
+
+
+def _parse_refermsg_element(ref) -> dict:
+    if ref is None:
+        return {}
+    ref_type = (ref.findtext('type') or '').strip()
+    ref_svrid = (ref.findtext('svrid') or ref.findtext('msgsvrid') or '').strip()
+    ref_content = (ref.findtext('content') or '') or ''
+    ref_name = (ref.findtext('displayname') or '').strip()
+    ref_create_time_raw = (ref.findtext('createtime') or ref.findtext('createTime') or '').strip()
+    ref_create_time = None
+    if ref_create_time_raw.isdigit():
+        ref_create_time = int(ref_create_time_raw)
+    ref_image_id = ''
+    ref_image_md5 = ''
+    if ref_content and '<img' in ref_content.lower():
+        md5_match = re.search(r'md5=["\']([0-9a-fA-F]+)["\']', ref_content)
+        if md5_match:
+            ref_image_md5 = md5_match.group(1).lower()
+            ref_image_id = f'wx_img_{ref_image_md5}'
+    return {
+        'ref_name': ref_name,
+        'ref_content': ref_content,
+        'ref_type': ref_type or None,
+        'ref_svrid': ref_svrid or None,
+        'ref_msgid': ref_svrid or None,
+        'ref_create_time': ref_create_time,
+        'ref_image_id': ref_image_id or None,
+        'ref_image_md5': ref_image_md5 or None,
+    }
+
+
+def parse_appmsg_rich(content: str, local_type: int = 0) -> dict | None:
+    """解析微信 appmsg XML（含 type=57 引用回复）。"""
+    xml_text = _extract_xml_document(content)
+    if not xml_text or '<appmsg' not in xml_text:
+        return None
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml_text)
+        appmsg = root.find('.//appmsg')
+        if appmsg is None:
+            return None
+        title = (appmsg.findtext('title') or '').strip()
+        des = (appmsg.findtext('des') or '').strip()
+        url = (appmsg.findtext('url') or '').strip().replace('&amp;', '&')
+        sub_type = int(local_type) >> 32 if int(local_type) > 4294967296 else 0
+        app_type = int(appmsg.findtext('type') or sub_type or 0)
+        if app_type == 57:
+            ref_fields = _parse_refermsg_element(appmsg.find('.//refermsg'))
+            ref_content = ref_fields.get('ref_content') or ''
+            if ref_content and str(ref_fields.get('ref_type') or '') != '3':
+                ref_fields['ref_content'] = ref_content.strip()[:2000]
+            return {'type': 'quote', 'title': title, **ref_fields}
+        if app_type == 6:
+            attach = appmsg.find('.//appattach')
+            return {
+                'type': 'file',
+                'title': title,
+                'file_ext': (attach.findtext('fileext') or '') if attach is not None else '',
+                'file_size': int(attach.findtext('totallen') or 0) if attach is not None else 0,
+            }
+        if title or url:
+            return {'type': 'link', 'title': title, 'des': des[:200], 'url': url}
+    except Exception:
+        return None
+    return None
+
+
+def _mention_source_text(text: str) -> str:
+    if not text:
+        return ''
+    if '<?xml' in text or '<appmsg' in text:
+        rich = parse_appmsg_rich(text)
+        return (rich or {}).get('title') or ''
+    return text
+
+
+def parse_mentions(text: str, bot_name: str, aliases: list[str]) -> list[dict]:
+    """从正文提取 @ 列表；保留微信零宽字符边界。"""
+    text = _mention_source_text(text)
+    if not text:
+        return []
+    seen: set[str] = set()
+    mentions: list[dict] = []
+    for match in re.finditer(r'@([^\s@​\u200b\u2005]+)', text):
+        name = match.group(1).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        mentions.append({
+            'name': name,
+            'is_bot': _is_bot_mention(name, bot_name, aliases),
+        })
+    return mentions
+
+
+def detect_at_bot(
+    raw_text: str,
+    bot_name: str,
+    aliases: list[str],
+    mentions: list[dict] | None = None,
+) -> bool:
+    if mentions and any(m.get('is_bot') for m in mentions):
+        return True
+    text = _mention_source_text(raw_text or '')
+    if not text:
+        text = raw_text or ''
+    for name in _bot_names(bot_name, aliases):
+        if re.search(r'@' + re.escape(name) + r'(?:\s|$|[\u200b\u2005])', text, re.IGNORECASE):
+            return True
+        if f'@{name}' in text:
             return True
     return False
 
@@ -183,25 +346,433 @@ def _ingress_message_type(base_type: int, rich: dict | None) -> str:
     return 'text'
 
 
+def _extract_message_body(content: str, is_group: bool) -> str:
+    body = content or ''
+    if is_group and ':\n' in body:
+        body = body.split(':\n', 1)[1]
+    return body
+
+
 def _clean_group_text(content: str, is_group: bool) -> tuple[str, str]:
-    raw = content or ''
-    text = raw
-    if is_group and ':\n' in text:
-        text = text.split(':\n', 1)[1]
-    cleaned = _collapse_text(text)
-    return cleaned, raw
+    body = _extract_message_body(content, is_group)
+    return _collapse_text(body), body
 
 
-def _build_quote(rich: dict | None) -> dict | None:
+def _quote_is_image(rich: dict) -> bool:
+    ref_type = rich.get('ref_type')
+    if ref_type is not None:
+        try:
+            ref_type_int = int(ref_type)
+            if ref_type_int == 3:
+                return True
+            if ref_type_int == 1:
+                return False
+        except (TypeError, ValueError):
+            pass
+    ref_content = (rich.get('ref_content') or '').strip()
+    if not ref_content:
+        return False
+    lowered = ref_content.lower()
+    if lowered in ('[图片]', '[image]'):
+        return True
+    if '<img' in lowered or '<msg><img' in lowered:
+        return True
+    return False
+
+
+def _normalize_quote_ref_text(ref_content: str) -> str:
+    """提取引用正文纯文本，供 Running admin_quote_undo 等命令使用。"""
+    text = (ref_content or '').strip()
+    if not text:
+        return ''
+    if text in ('引用文字', '[引用消息]'):
+        return ''
+    if ':\n' in text and not text.lstrip().startswith('<'):
+        text = text.split(':\n', 1)[1].strip()
+    if '<' in text and '>' in text:
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(text)
+            for tag in ('title', 'content', 'des'):
+                for elem in root.iter(tag):
+                    val = (elem.text or '').strip()
+                    if val and val not in ('引用文字', '[引用消息]'):
+                        return val
+            joined = ''.join(root.itertext()).strip()
+            if joined and joined not in ('引用文字', '[引用消息]'):
+                return joined
+        except Exception:
+            pass
+    return text
+
+
+def _config_aes_key(config: RunningBotPushConfig) -> bytes | str | None:
+    key = config.image_aes_key
+    if not key:
+        return None
+    return key
+
+
+def _rank_dat_files(dat_files: list[str], file_md5: str) -> list[str]:
+    ranked = []
+    for f in dat_files:
+        fname = os.path.basename(f).lower()
+        sz = os.path.getsize(f)
+        if '_t_' in fname:
+            rank = 5
+        elif '_t.' in fname:
+            rank = 4
+        elif '_w.' in fname:
+            rank = 2
+        elif '_h.' in fname:
+            rank = 1
+        else:
+            rank = 0
+        ranked.append((rank, sz, f))
+    ranked.sort(key=lambda x: (x[0], -x[1]))
+    return [f for _rank, _sz, f in ranked]
+
+
+def _find_dat_files_for_md5(
+    config: RunningBotPushConfig,
+    username: str,
+    file_md5: str,
+) -> tuple[list[str], str | None]:
+    """在 attach 目录查找 .dat；优先当前会话 hash，再扫描其它 hash。"""
+    if not config.wechat_base_dir:
+        return [], 'no_wechat_base_dir'
+    attach_root = os.path.join(config.wechat_base_dir, 'msg', 'attach')
+    if not os.path.isdir(attach_root):
+        return [], 'no_attach_dir'
+
+    username_hashes: list[str] = []
+    if username:
+        username_hashes.append(hashlib.md5(username.encode()).hexdigest())
+    try:
+        for entry in os.listdir(attach_root):
+            if entry not in username_hashes:
+                username_hashes.append(entry)
+    except OSError:
+        pass
+
+    found: list[str] = []
+    pattern_tail = os.path.join('*', 'Img', f'{file_md5}*.dat')
+    for uh in username_hashes:
+        search_base = os.path.join(attach_root, uh)
+        if not os.path.isdir(search_base):
+            continue
+        found.extend(glob.glob(os.path.join(search_base, pattern_tail)))
+    return sorted(set(found)), None
+
+
+def _convert_hevc_to_jpeg(hevc_path: str, jpeg_path: str) -> str | None:
+    """wxgf/HEVC → JPEG（需 PyAV）。"""
+    try:
+        import av
+    except ImportError:
+        return None
+    try:
+        with open(hevc_path, 'rb') as f:
+            data = f.read()
+        vps_sig = b'\x00\x00\x00\x01\x40\x01'
+        hevc_start = data.find(vps_sig)
+        if hevc_start < 0:
+            hevc_start = data.find(b'\x00\x00\x00\x01\x42\x01')
+        if hevc_start < 0:
+            return None
+        h265_path = hevc_path + '.h265'
+        with open(h265_path, 'wb') as f:
+            f.write(data[hevc_start:])
+        try:
+            container = av.open(h265_path, format='hevc')
+            for frame in container.decode(video=0):
+                img = frame.to_image()
+                img.save(jpeg_path, 'JPEG', quality=90)
+                container.close()
+                return jpeg_path
+            container.close()
+        finally:
+            if os.path.isfile(h265_path):
+                os.unlink(h265_path)
+    except Exception:
+        return None
+    return None
+
+
+def _extract_quote_image_md5(rich: dict) -> str | None:
+    md5 = rich.get('ref_image_md5')
+    if md5:
+        return str(md5).lower()
+    image_id = rich.get('ref_image_id') or ''
+    if image_id.startswith('wx_img_'):
+        return image_id[7:].lower()
+    ref_content = rich.get('ref_content') or ''
+    match = re.search(r'md5=["\']([0-9a-fA-F]+)["\']', ref_content)
+    if match:
+        return match.group(1).lower()
+    return None
+
+
+def _mime_for_image_path(path: str) -> str | None:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.jpg', '.jpeg'):
+        return 'image/jpeg'
+    if ext == '.png':
+        return 'image/png'
+    if ext == '.webp':
+        return 'image/webp'
+    return None
+
+
+def _build_inline_media_from_file(
+    decoded_image_dir: str,
+    img_name: str,
+    image_id: str | None = None,
+) -> dict | None:
+    local_path = os.path.join(decoded_image_dir, img_name)
+    if not os.path.isabs(local_path):
+        local_path = os.path.abspath(local_path)
+    if not os.path.isfile(local_path):
+        return None
+    mime = _mime_for_image_path(local_path)
+    if not mime:
+        return None
+    image_id = image_id or os.path.splitext(img_name)[0]
+    with open(local_path, 'rb') as f:
+        raw_bytes = f.read()
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    return {
+        'image_id': image_id,
+        'media': {
+            'transport': 'inline_base64',
+            'content_base64': base64.b64encode(raw_bytes).decode('ascii'),
+            'mime_type': mime,
+            'file_name': os.path.basename(local_path),
+            'size_bytes': len(raw_bytes),
+            'sha256': digest,
+        },
+    }
+
+
+def _lookup_image_file_md5_from_resource_db(
+    resource_db_path: str,
+    *,
+    svrid: str | int | None = None,
+    create_time: int | None = None,
+) -> str | None:
+    """通过 message_resource.db 查被引用图片的本地文件 MD5（attach 文件名用）。"""
+    if not resource_db_path or not os.path.isfile(resource_db_path):
+        return None
+    from decode_image import extract_md5_from_packed_info
+
+    image_type_sql = (
+        '(message_local_type = 3 OR message_local_type % 4294967296 = 3)'
+    )
+    try:
+        conn = sqlite3.connect(f'file:{resource_db_path}?mode=ro', uri=True)
+        row = None
+        if svrid is not None and str(svrid).strip():
+            try:
+                svrid_int = int(str(svrid).strip())
+            except (TypeError, ValueError):
+                svrid_int = None
+            if svrid_int is not None:
+                row = conn.execute(
+                    f'SELECT packed_info FROM MessageResourceInfo '
+                    f'WHERE message_svr_id = ? AND {image_type_sql}',
+                    (svrid_int,),
+                ).fetchone()
+        if not row and create_time is not None:
+            row = conn.execute(
+                f'SELECT packed_info FROM MessageResourceInfo '
+                f'WHERE message_create_time = ? AND {image_type_sql}',
+                (int(create_time),),
+            ).fetchone()
+        conn.close()
+        if row and row[0]:
+            return extract_md5_from_packed_info(row[0])
+    except sqlite3.Error:
+        return None
+    return None
+
+
+def resolve_quoted_image_local_name(
+    rich: dict,
+    username: str,
+    config: RunningBotPushConfig,
+    *,
+    resource_db_path: str | None = None,
+    log_miss: bool = False,
+) -> str | None:
+    """解析引用图片：refermsg md5 失败时，用 svrid/create_time 回查真实文件 MD5。"""
+    if not rich or not _quote_is_image(rich):
+        return None
+
+    quote_md5 = _extract_quote_image_md5(rich)
+    if quote_md5:
+        img_name = resolve_decoded_image_by_md5(
+            username, quote_md5, config, log_miss=False,
+        )
+        if img_name:
+            return img_name
+
+    file_md5 = None
+    ref_svrid = rich.get('ref_svrid') or rich.get('ref_msgid')
+    ref_create_time = rich.get('ref_create_time')
+    if resource_db_path:
+        file_md5 = _lookup_image_file_md5_from_resource_db(
+            resource_db_path, svrid=ref_svrid, create_time=ref_create_time,
+        )
+    if not file_md5 or file_md5 == quote_md5:
+        if log_miss:
+            reason = 'no_dat'
+            if quote_md5 and file_md5 and file_md5 != quote_md5:
+                reason = 'no_dat'
+            elif quote_md5 and resource_db_path and not file_md5:
+                reason = 'no_resource'
+            hint = (quote_md5 or '')[:12]
+            print(
+                f'  [running-bot-push] 引用图未就绪 md5={hint} reason={reason}',
+                flush=True,
+            )
+        return None
+
+    if quote_md5 and file_md5 != quote_md5:
+        print(
+            f'  [running-bot-push] 引用图 MD5 不一致 '
+            f'quote={quote_md5[:12]} file={file_md5[:12]}，已通过 svrid 回查',
+            flush=True,
+        )
+    return resolve_decoded_image_by_md5(
+        username, file_md5, config, log_miss=log_miss,
+    )
+
+
+def resolve_decoded_image_by_md5(
+    username: str,
+    file_md5: str,
+    config: RunningBotPushConfig,
+    *,
+    log_miss: bool = False,
+) -> str | None:
+    """根据图片 MD5 解密 .dat，返回 decoded_images 下的文件名。"""
+    if not file_md5 or not config.decoded_image_dir:
+        if log_miss:
+            print('  [running-bot-push] 引用图未就绪: 缺少 md5 或 decoded_image_dir', flush=True)
+        return None
+
+    os.makedirs(config.decoded_image_dir, exist_ok=True)
+    out_base = os.path.join(config.decoded_image_dir, file_md5)
+    for ext in ('jpg', 'png', 'webp'):
+        candidate = f'{out_base}.{ext}'
+        if os.path.isfile(candidate):
+            return os.path.basename(candidate)
+
+    from decode_image import decrypt_dat_file, is_v2_format
+
+    dat_files, miss_reason = _find_dat_files_for_md5(config, username, file_md5)
+    if not dat_files:
+        if log_miss:
+            reason = miss_reason or 'no_dat'
+            print(
+                f'  [running-bot-push] 引用图未就绪 md5={file_md5[:12]} reason={reason}',
+                flush=True,
+            )
+        return None
+
+    aes_key = _config_aes_key(config)
+    for selected in _rank_dat_files(dat_files, file_md5):
+        if is_v2_format(selected) and not aes_key:
+            continue
+        result_path, fmt = decrypt_dat_file(
+            selected, f'{out_base}.tmp', aes_key, config.image_xor_key,
+        )
+        if not result_path:
+            continue
+        if fmt in ('hevc', 'bin'):
+            jpg_path = _convert_hevc_to_jpeg(result_path, f'{out_base}.jpg')
+            try:
+                os.unlink(result_path)
+            except OSError:
+                pass
+            if jpg_path:
+                return os.path.basename(jpg_path)
+            if log_miss:
+                print(
+                    f'  [running-bot-push] 引用图 HEVC 转 JPEG 失败 md5={file_md5[:12]}',
+                    flush=True,
+                )
+            continue
+        if fmt not in ('jpg', 'png', 'webp'):
+            try:
+                os.unlink(result_path)
+            except OSError:
+                pass
+            continue
+        final = f'{out_base}.{fmt}'
+        if os.path.isfile(final):
+            os.unlink(final)
+        os.rename(result_path, final)
+        return os.path.basename(final)
+    if log_miss:
+        print(
+            f'  [running-bot-push] 引用图解密失败 md5={file_md5[:12]} dat={len(dat_files)}',
+            flush=True,
+        )
+    return None
+
+
+def quote_has_inline_media(quote: dict | None) -> bool:
+    if not quote or quote.get('type') != 'image':
+        return True
+    media = quote.get('media') or {}
+    return bool(media.get('content_base64'))
+
+
+def should_defer_quote_image_push(payload: dict) -> bool:
+    quote = (payload.get('message') or {}).get('quote')
+    return not quote_has_inline_media(quote)
+
+
+def _build_quote(
+    rich: dict | None,
+    *,
+    username: str = '',
+    config: RunningBotPushConfig | None = None,
+    pre_image_name: str | None = None,
+) -> dict | None:
     if not rich or rich.get('type') != 'quote':
         return None
-    return {
-        'message_id': None,
+    ref_content = _normalize_quote_ref_text(rich.get('ref_content') or '')
+    ref_msgid = rich.get('ref_msgid') or rich.get('ref_svrid') or ''
+    is_image = _quote_is_image(rich)
+    quote = {
+        'message_id': str(ref_msgid) if ref_msgid else None,
         'sender_name': rich.get('ref_name') or '',
-        'text': rich.get('ref_content') or '',
-        'type': 'text',
-        'image_id': None,
+        'text': '' if is_image else ref_content,
+        'type': 'image' if is_image else 'text',
     }
+    if is_image:
+        file_md5 = _extract_quote_image_md5(rich)
+        image_id = rich.get('ref_image_id') or ''
+        if not image_id and file_md5:
+            image_id = f'wx_img_{file_md5}'
+        if not image_id and ref_msgid:
+            image_id = f'wx_img_{ref_msgid}'
+        quote['image_id'] = image_id or None
+        if config and (pre_image_name or (username and file_md5)):
+            img_name = pre_image_name
+            if not img_name and file_md5:
+                img_name = resolve_decoded_image_by_md5(username, file_md5, config, log_miss=False)
+            if img_name:
+                inline = _build_inline_media_from_file(
+                    config.decoded_image_dir, img_name, image_id=image_id,
+                )
+                if inline:
+                    quote['media'] = inline['media']
+                    if not quote.get('image_id'):
+                        quote['image_id'] = inline.get('image_id')
+    return quote
 
 
 def _build_images(msg_data: dict, decoded_image_dir: str) -> list[dict]:
@@ -215,34 +786,8 @@ def _build_images(msg_data: dict, decoded_image_dir: str) -> list[dict]:
         img_name = msg_data['image_local_name']
     if not img_name:
         return []
-    local_path = os.path.join(decoded_image_dir, img_name)
-    if not os.path.isabs(local_path):
-        local_path = os.path.abspath(local_path)
-    if not os.path.isfile(local_path):
-        return []
-    image_id = os.path.splitext(img_name)[0]
-    ext = os.path.splitext(img_name)[1].lower()
-    mime = 'image/jpeg'
-    if ext == '.png':
-        mime = 'image/png'
-    elif ext == '.webp':
-        mime = 'image/webp'
-    elif ext not in ('.jpg', '.jpeg'):
-        return []
-    with open(local_path, 'rb') as f:
-        raw_bytes = f.read()
-    digest = hashlib.sha256(raw_bytes).hexdigest()
-    return [{
-        'image_id': image_id,
-        'media': {
-            'transport': 'inline_base64',
-            'content_base64': base64.b64encode(raw_bytes).decode('ascii'),
-            'mime_type': mime,
-            'file_name': os.path.basename(local_path),
-            'size_bytes': len(raw_bytes),
-            'sha256': digest,
-        },
-    }]
+    inline = _build_inline_media_from_file(decoded_image_dir, img_name)
+    return [inline] if inline else []
 
 
 def build_ingress_payload(
@@ -270,6 +815,13 @@ def build_ingress_payload(
         (not is_group and username == self_wxid)
     ))
 
+    rich = msg_data.get('rich') or msg_data.get('rich_content')
+    if not rich:
+        raw_for_parse = msg_data.get('raw_content') or msg_data.get('content') or ''
+        rich = parse_appmsg_rich(raw_for_parse, int(msg_data.get('msg_type_raw', 0) or 0))
+        if rich:
+            msg_data['rich'] = rich
+
     content = msg_data.get('raw_content') or msg_data.get('content') or ''
     text, raw_text = _clean_group_text(content, is_group)
     if msg_data.get('raw_text'):
@@ -280,9 +832,8 @@ def build_ingress_payload(
     rich = msg_data.get('rich') or msg_data.get('rich_content')
     if rich and rich.get('type') == 'quote':
         reply_text = rich.get('title') or text
+        raw_text = reply_text
         text = _collapse_text(reply_text)
-        if not raw_text:
-            raw_text = text
 
     local_id = msg_data.get('local_id')
     message_id = stable_message_id(
@@ -292,16 +843,25 @@ def build_ingress_payload(
     )
     chat_id = username
     event_id = stable_event_id(chat_id, message_id)
-    trace_id = msg_data.get('_push_trace_id') or str(uuid.uuid4())
+    trace_id = msg_data.get('_push_trace_id') or stable_trace_id(event_id)
 
     base_type = _base_msg_type(msg_data.get('msg_type_raw', 0))
     ingress_type = _ingress_message_type(base_type, rich)
-    quote = _build_quote(rich)
+    quote = _build_quote(
+        rich,
+        username=username,
+        config=config,
+        pre_image_name=msg_data.get('_quote_image_local_name'),
+    )
     images = _build_images(msg_data, config.decoded_image_dir) if ingress_type == 'image' else []
+    mentions = parse_mentions(raw_text or text, config.bot_name, config.bot_aliases)
+    is_at_bot = detect_at_bot(
+        raw_text or text, config.bot_name, config.bot_aliases, mentions=mentions,
+    )
 
     return {
         'source': 'wechat',
-        'adapter': 'wechat-decryptor-local',
+        'adapter': 'wechat-decryptor',
         'event_id': event_id,
         'trace_id': trace_id,
         'timestamp': _iso_cn(msg_data.get('timestamp')),
@@ -322,8 +882,8 @@ def build_ingress_payload(
             'type': ingress_type,
             'text': text,
             'raw_text': raw_text or text,
-            'mentions': [],
-            'is_at_bot': detect_at_bot(raw_text or text, config.bot_name, config.bot_aliases),
+            'mentions': mentions,
+            'is_at_bot': is_at_bot,
             'quote': quote,
             'images': images,
         },
@@ -485,35 +1045,157 @@ def _load_name2id(db_path: str) -> dict:
     return id_to_username
 
 
+def _parse_ingress_response(body: str) -> dict:
+    if not body:
+        return {}
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+
+
+def evaluate_ingress_response(
+    response_status: int | None,
+    response_json: dict,
+) -> tuple[bool, bool, str | None]:
+    """判定 ingress 是否投递成功。
+
+    Returns:
+        (success, retryable, error_message)
+    """
+    if response_status is None:
+        return False, True, 'no_response'
+
+    if 400 <= response_status < 500:
+        err = (
+            response_json.get('error_code')
+            or response_json.get('error')
+            or f'HTTP {response_status}'
+        )
+        return False, False, str(err)
+
+    if not (200 <= response_status < 300):
+        return False, True, f'HTTP {response_status}'
+
+    if response_json.get('duplicate'):
+        return True, False, None
+
+    if response_json.get('accepted') is False:
+        err = response_json.get('error_code') or response_json.get('error') or 'not_accepted'
+        return False, False, str(err)
+
+    running = response_json.get('running_response') or {}
+    exec_status = running.get('execution_status')
+    if exec_status in ('handled', 'queued'):
+        return True, False, None
+
+    outbox_ids = running.get('outbox_ids') or response_json.get('outbox_ids')
+    if outbox_ids:
+        return True, False, None
+
+    if response_json.get('image_job_id') or running.get('image_job_id'):
+        return True, False, None
+
+    if response_json.get('accepted') is True:
+        return True, False, None
+
+    if not response_json:
+        return True, False, None
+
+    return True, False, None
+
+
+def _redact_payload_for_log(payload: dict) -> dict:
+    """复制 payload 供日志输出；不打印完整 base64。"""
+    data = json.loads(json.dumps(payload, ensure_ascii=False))
+    for img in (data.get('message') or {}).get('images') or []:
+        media = img.get('media') or {}
+        b64 = media.get('content_base64') or ''
+        if b64:
+            media['content_base64'] = f'<redacted len={len(b64)} sha256={media.get("sha256", "")[:16]}...>'
+    quote = (data.get('message') or {}).get('quote') or {}
+    quote_media = quote.get('media') or {}
+    b64 = quote_media.get('content_base64') or ''
+    if b64:
+        quote_media['content_base64'] = (
+            f'<redacted len={len(b64)} sha256={quote_media.get("sha256", "")[:16]}...>'
+        )
+    return data
+
+
+def log_ingress_post(config: RunningBotPushConfig, payload: dict, attempt: int = 0) -> None:
+    if not config.log_post_payload:
+        return
+    event_id = payload.get('event_id', '')
+    print(
+        f'[running-bot-push] POST {config.ingress_url} attempt={attempt} event_id={event_id}',
+        flush=True,
+    )
+    print(json.dumps(_redact_payload_for_log(payload), ensure_ascii=False, indent=2), flush=True)
+
+
+def log_ingress_response(
+    payload: dict,
+    response_status: int | None,
+    response_json: dict | None,
+) -> None:
+    event_id = payload.get('event_id', '')
+    print(
+        f'[running-bot-push] RESPONSE status={response_status} event_id={event_id}',
+        flush=True,
+    )
+    if response_json:
+        print(json.dumps(response_json, ensure_ascii=False, indent=2), flush=True)
+
+
 def push_with_retry(
     payload: dict,
     config: RunningBotPushConfig,
-) -> tuple[str, int | None, str | None, int]:
-    body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+) -> tuple[str, int | None, str | None, int, dict]:
     headers = {'Content-Type': 'application/json; charset=utf-8'}
     max_attempts = max(1, config.retry_count + 1)
     last_error = None
     response_status = None
+    response_json: dict = {}
 
     for attempt in range(max_attempts):
+        payload['delivery']['retry_count'] = attempt
+        body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        if config.log_post_payload:
+            log_ingress_post(config, payload, attempt)
         try:
             req = urllib.request.Request(
                 config.ingress_url, data=body, headers=headers, method='POST',
             )
             with urllib.request.urlopen(req, timeout=config.timeout_seconds) as resp:
                 response_status = resp.status
-                payload['delivery']['retry_count'] = attempt
-                return 'success', response_status, None, attempt
+                response_json = _parse_ingress_response(
+                    resp.read().decode('utf-8', errors='replace'),
+                )
         except urllib.error.HTTPError as e:
             response_status = e.code
-            last_error = f'HTTP {e.code}: {e.reason}'
+            err_body = e.read().decode('utf-8', errors='replace')
+            response_json = _parse_ingress_response(err_body)
         except Exception as e:
             last_error = str(e)
+            if attempt < max_attempts - 1:
+                time.sleep(0.5 * (attempt + 1))
+            continue
+
+        if config.log_post_payload:
+            log_ingress_response(payload, response_status, response_json)
+
+        success, retryable, err = evaluate_ingress_response(response_status, response_json)
+        if success:
+            return 'success', response_status, None, attempt, response_json
+        last_error = err
+        if not retryable:
+            break
         if attempt < max_attempts - 1:
             time.sleep(0.5 * (attempt + 1))
 
     payload['delivery']['retry_count'] = max_attempts - 1
-    return 'failed', response_status, last_error, max_attempts - 1
+    return 'failed', response_status, last_error, max_attempts - 1, response_json
 
 
 def log_push(
@@ -528,6 +1210,7 @@ def log_push(
     response_status: int | None = None,
     error_message: str | None = None,
     skipped: bool = False,
+    response_json: dict | None = None,
 ):
     parts = [
         '[running-bot-push]',
@@ -544,6 +1227,19 @@ def log_push(
         parts.append('skipped=dedupe')
     if response_status is not None:
         parts.append(f'response_status={response_status}')
+    if response_json:
+        if response_json.get('duplicate'):
+            parts.append('duplicate=true')
+        running = response_json.get('running_response') or {}
+        handler = running.get('handler_name') or response_json.get('handler_name')
+        execution = running.get('execution_status') or response_json.get('execution_status')
+        if handler:
+            parts.append(f'handler_name={handler}')
+        if execution:
+            parts.append(f'execution_status={execution}')
+        error_code = response_json.get('error_code')
+        if error_code:
+            parts.append(f'error_code={error_code}')
     if error_message:
         parts.append(f'error_message={error_message}')
     print(' '.join(parts), flush=True)
@@ -608,10 +1304,10 @@ class RunningBotOutbox:
                 if row:
                     conn.execute('''
                         UPDATE running_bot_outbox
-                        SET payload_json=?, status=CASE WHEN status='delivering' THEN 'pending' ELSE status END,
+                        SET status=CASE WHEN status='delivering' THEN 'pending' ELSE status END,
                             updated_at=?
                         WHERE dedupe_key=?
-                    ''', (payload_json, now, dedupe_key))
+                    ''', (now, dedupe_key))
                     conn.commit()
                     return row[0]
                 conn.execute('''
@@ -642,10 +1338,12 @@ class RunningBotOutbox:
                 rows = conn.execute('''
                     SELECT dedupe_key, payload_json
                     FROM running_bot_outbox
-                    WHERE status IN ('pending', 'failed') AND next_retry_at <= ?
+                    WHERE status IN ('pending', 'failed')
+                      AND next_retry_at <= ?
+                      AND attempts < ?
                     ORDER BY created_at ASC
                     LIMIT ?
-                ''', (now, self.config.outbox_batch_size)).fetchall()
+                ''', (now, self.config.outbox_max_attempts, self.config.outbox_batch_size)).fetchall()
                 keys = [r[0] for r in rows]
                 if keys:
                     conn.executemany(
@@ -681,11 +1379,12 @@ class RunningBotOutbox:
                 ).fetchone()
                 attempts = (row[0] if row else 0) + 1
                 delay = min(300, 5 * (2 ** min(attempts - 1, 6)))
+                status = 'abandoned' if attempts >= self.config.outbox_max_attempts else 'failed'
                 conn.execute('''
                     UPDATE running_bot_outbox
-                    SET status='failed', attempts=?, next_retry_at=?, last_error=?, updated_at=?
+                    SET status=?, attempts=?, next_retry_at=?, last_error=?, updated_at=?
                     WHERE dedupe_key=?
-                ''', (attempts, now + delay, error_message or '', now, dedupe_key))
+                ''', (status, attempts, now + delay, error_message or '', now, dedupe_key))
                 conn.commit()
             finally:
                 conn.close()
@@ -702,7 +1401,9 @@ class RunningBotOutbox:
                 except json.JSONDecodeError as e:
                     self._mark_failed(dedupe_key, f'payload decode failed: {e}')
                     continue
-                push_status, response_status, error_message, _ = push_with_retry(payload, self.config)
+                push_status, response_status, error_message, _, response_json = push_with_retry(
+                    payload, self.config,
+                )
                 if push_status == 'success':
                     self._mark_delivered(dedupe_key)
                 else:
@@ -714,6 +1415,7 @@ class RunningBotOutbox:
                     payload.get('message', {}).get('type', ''), push_status,
                     response_status=response_status,
                     error_message=error_message,
+                    response_json=response_json,
                 )
 
 
@@ -757,6 +1459,17 @@ class RunningBotPusher:
             except Exception as e:
                 print(f'  [running-bot-push] enrich 失败: {e}', flush=True)
 
+        rich = msg_data.get('rich') or msg_data.get('rich_content')
+        if rich and _quote_is_image(rich) and not msg_data.get('_quote_image_local_name'):
+            resource_db_path = None
+            if getattr(monitor, 'db_cache', None):
+                resource_db_path = monitor.db_cache.get(os.path.join('message', 'message_resource.db'))
+            msg_data['_quote_image_local_name'] = resolve_quoted_image_local_name(
+                rich, username, self.config,
+                resource_db_path=resource_db_path,
+                log_miss=False,
+            )
+
         payload = build_ingress_payload(msg_data, self.config, self.contact_names)
         ingress_type = payload['message']['type']
         images = payload['message']['images']
@@ -766,6 +1479,16 @@ class RunningBotPusher:
             and not images
             and not msg_data.get('_allow_empty_image')
         ):
+            return
+        if self.config.reliable_mode and should_defer_quote_image_push(payload):
+            rich = msg_data.get('rich') or msg_data.get('rich_content')
+            file_md5 = _extract_quote_image_md5(rich) if rich else None
+            md5_hint = (file_md5 or '')[:12]
+            print(
+                f'  [running-bot-push] 引用图 inline 未就绪，推迟推送 '
+                f'local_id={msg_data.get("local_id")} md5={md5_hint}',
+                flush=True,
+            )
             return
         dedupe_key = payload['delivery']['dedupe_key']
         if self.outbox:
@@ -791,7 +1514,9 @@ class RunningBotPusher:
             return
 
         msg_data['_push_trace_id'] = payload['trace_id']
-        push_status, response_status, error_message, _ = push_with_retry(payload, self.config)
+        push_status, response_status, error_message, _, response_json = push_with_retry(
+            payload, self.config,
+        )
         if partial and push_status == 'success':
             push_status = 'partial'
 
@@ -802,6 +1527,7 @@ class RunningBotPusher:
             payload['message']['type'], push_status,
             response_status=response_status,
             error_message=error_message,
+            response_json=response_json,
         )
 
 

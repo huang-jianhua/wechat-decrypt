@@ -40,8 +40,11 @@ from running_bot_push import (
     schedule_push,
     should_defer_push,
     should_push,
+    parse_appmsg_rich,
     _base_msg_type,
     _build_images,
+    _quote_is_image,
+    resolve_quoted_image_local_name,
     _SKIP_BASE_TYPES,
 )
 _cfg = load_config()
@@ -712,10 +715,28 @@ class RunningBotReliableScanner:
                     name2id=name2id,
                     contact_names=self.contact_names,
                 )
-                if base == 49:
-                    rich = self._parse_rich_from_content(msg_data.get('raw_content', ''), local_type)
+                if not msg_data.get('rich'):
+                    rich = parse_appmsg_rich(
+                        msg_data.get('raw_content') or msg_data.get('content') or '',
+                        local_type,
+                    )
                     if rich:
                         msg_data['rich'] = rich
+                rich = msg_data.get('rich')
+                if rich and _quote_is_image(rich):
+                    resource_db_path = None
+                    if self.db_cache:
+                        resource_db_path = self.db_cache.get(
+                            os.path.join('message', 'message_resource.db'),
+                        )
+                    img_name = resolve_quoted_image_local_name(
+                        rich, username, pusher.config,
+                        resource_db_path=resource_db_path,
+                        log_miss=True,
+                    )
+                    if not img_name:
+                        continue
+                    msg_data['_quote_image_local_name'] = img_name
                 if base == 3:
                     img_name = self._resolve_image_by_local_id(username, db_key, local_id, create_time)
                     if img_name is None:
@@ -842,40 +863,37 @@ class RunningBotReliableScanner:
         return '__v2_unsupported__'
 
     def _parse_rich_from_content(self, mc, local_type):
-        if not mc or '<appmsg' not in mc:
-            return None
-        try:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(mc)
-            appmsg = root.find('.//appmsg')
-            if appmsg is None:
-                return None
-            title = (appmsg.findtext('title') or '').strip()
-            des = (appmsg.findtext('des') or '').strip()
-            url = (appmsg.findtext('url') or '').strip().replace('&amp;', '&')
-            sub_type = int(local_type) >> 32 if int(local_type) > 4294967296 else 0
-            app_type = int(appmsg.findtext('type') or sub_type or 0)
-            if app_type == 57:
-                ref = appmsg.find('.//refermsg')
-                return {
-                    'type': 'quote',
-                    'title': title,
-                    'ref_name': ref.findtext('displayname') if ref is not None else '',
-                    'ref_content': (ref.findtext('content') if ref is not None else '') or '',
-                }
-            if app_type == 6:
-                attach = appmsg.find('.//appattach')
-                return {
-                    'type': 'file',
-                    'title': title,
-                    'file_ext': (attach.findtext('fileext') or '') if attach is not None else '',
-                    'file_size': int(attach.findtext('totallen') or 0) if attach is not None else 0,
-                }
-            if title or url:
-                return {'type': 'link', 'title': title, 'des': des[:200], 'url': url}
-        except Exception:
-            return None
-        return None
+        return parse_appmsg_rich(mc, local_type)
+
+
+def _parse_refermsg_fields(ref) -> dict:
+    """从 refermsg XML 元素提取引用元数据。"""
+    if ref is None:
+        return {}
+    ref_type = (ref.findtext('type') or '').strip()
+    ref_svrid = (ref.findtext('svrid') or ref.findtext('msgsvrid') or '').strip()
+    ref_content = (ref.findtext('content') or '') or ''
+    ref_name = (ref.findtext('displayname') or '').strip()
+    ref_create_time_raw = (ref.findtext('createtime') or ref.findtext('createTime') or '').strip()
+    ref_create_time = int(ref_create_time_raw) if ref_create_time_raw.isdigit() else None
+    ref_image_id = ''
+    ref_image_md5 = ''
+    if ref_content and '<img' in ref_content.lower():
+        import re as _re
+        md5_match = _re.search(r'md5=["\']([0-9a-fA-F]+)["\']', ref_content)
+        if md5_match:
+            ref_image_md5 = md5_match.group(1).lower()
+            ref_image_id = f'wx_img_{ref_image_md5}'
+    return {
+        'ref_name': ref_name,
+        'ref_content': ref_content,
+        'ref_type': ref_type or None,
+        'ref_svrid': ref_svrid or None,
+        'ref_msgid': ref_svrid or None,
+        'ref_create_time': ref_create_time,
+        'ref_image_id': ref_image_id or None,
+        'ref_image_md5': ref_image_md5 or None,
+    }
 
 
 def _convert_hevc_to_jpeg(hevc_path, jpeg_path):
@@ -1483,15 +1501,14 @@ class SessionMonitor:
                 if app_type == 57:
                     # 引用回复: title 是回复内容
                     ref = appmsg.find('.//refermsg')
-                    ref_name = ref.findtext('displayname') if ref is not None else ''
-                    ref_content = ref.findtext('content') if ref is not None else ''
-                    if ref_content:
-                        ref_content = ref_content.strip()[:100]
+                    ref_fields = _parse_refermsg_fields(ref)
+                    ref_content = ref_fields.get('ref_content') or ''
+                    if ref_content and str(ref_fields.get('ref_type') or '') != '3':
+                        ref_fields['ref_content'] = ref_content.strip()[:2000]
                     return {
                         'type': 'quote',
                         'title': title,
-                        'ref_name': ref_name or '',
-                        'ref_content': ref_content or '',
+                        **ref_fields,
                     }
                 elif app_type == 6:
                     # 文件

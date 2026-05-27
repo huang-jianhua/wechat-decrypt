@@ -160,7 +160,24 @@ python find_image_key.py
 
 ## running-bot 消息推送
 
-将监听到的微信消息标准化后，通过 HTTP 推送到本机 [running-bot](http://127.0.0.1:18765) 的 ingress 接口。**仅做信息入口**，不调用 Outbox、不发送微信、不处理跑团业务。
+将监听到的微信消息标准化后，通过 HTTP 推送到 Running Service ingress。**仅做信息入口**，不调用 Outbox、不发送微信、不处理跑团业务。
+
+### 正式契约（事实源）
+
+| 项 | 路径 |
+|----|------|
+| API 文档 | `16_WECHAT_DECRYPTOR_INGRESS_API.md`（**wechat_ingress_v1**） |
+| Running 侧字段映射 | `wechat_ingress_adapter.py`（外部 schema → 内部 StandardMessage） |
+| Decryptor 实现 | `running_bot_push.py` |
+
+**必须**使用：
+
+```http
+POST http://{running_host}:18765/api/ingress/wechat/message
+Content-Type: application/json
+```
+
+**禁止**：向 `POST /api/messages` 投递；禁止自行构造 Running 内部 `StandardMessage` 格式。
 
 ### 配置项（`config.json`）
 
@@ -169,11 +186,13 @@ python find_image_key.py
 | `enable_running_bot_push` | 是否开启推送 | `true` |
 | `running_bot_ingress_url` | ingress 地址 | `http://127.0.0.1:18765/api/ingress/wechat/message` |
 | `running_bot_push_timeout_seconds` | HTTP 超时（秒） | `5` |
-| `running_bot_push_retry_count` | 失败重试次数 | `2` |
+| `running_bot_push_retry_count` | HTTP 瞬时失败重试次数（同 event_id/trace_id） | `2` |
+| `running_bot_outbox_max_attempts` | 本地 outbox 最大投递次数 | `3` |
 | `running_bot_group_whitelist` | 群聊白名单（群名/wxid 模糊匹配） | `["跑团机器人测试"]` |
 | `running_bot_user_whitelist` | 私聊白名单（昵称/wxid 模糊匹配） | `[]` |
 | `running_bot_name` | 机器人昵称（用于识别 @） | `""` |
 | `running_bot_aliases` | 机器人别名列表 | `[]` |
+| `running_bot_log_post_payload` | POST 时打印请求/响应 JSON（图片 base64 脱敏） | `true` |
 
 本阶段默认**仅推送群「跑团机器人测试」**；私聊需往 `running_bot_user_whitelist` 添加联系人。
 
@@ -186,8 +205,10 @@ python find_image_key.py
 | `chat.type` | 群 `group` / 私聊 `private` |
 | `sender.id` | 群：发送者 wxid；私聊：对方 wxid |
 | `message.id` | `username:timestamp:local_id` 或 hash 回退 |
-| `event_id` / `delivery.dedupe_key` | `wechat:{chat.id}:{message.id}` |
-| `message.images[].local_path` | 解密后 `decoded_images/` 绝对路径 |
+| `event_id` / `trace_id` / `delivery.dedupe_key` | 稳定唯一；重试时三者不变（`trace_id` 默认等于 `event_id`） |
+| `message.images[]` | `media.transport=inline_base64` + `mime_type` / `size_bytes` / `sha256` / `content_base64` |
+| `message.mentions` / `message.is_at_bot` | @ 机器人路径必填（见 API 文档 §7） |
+| `message.quote` | 引用 `/撤销`、`/补卡`；引用图可带 `quote.media.inline_base64` |
 
 ### 日志
 
@@ -197,18 +218,41 @@ python find_image_key.py
 [running-bot-push] trace_id=... event_id=wechat:...@chatroom:... push_status=success response_status=200 ...
 ```
 
+### 幂等与重试（P0）
+
+- `event_id` / `delivery.dedupe_key` / `trace_id` 对同一条微信消息**稳定不变**（`trace_id` 默认等于 `event_id`）
+- HTTP `200` + `duplicate=true` → **视为成功，立即停止重试**
+- HTTP `4xx` 或 `accepted=false` → **不重试**，修正 payload 后再发
+- 本地 outbox 默认最多投递 **3 次**，超出标记 `abandoned`
+- Decryptor **不会**用 HTTP 响应里的 `reply` 直接发微信；仅 Running Outbox → Sender 回群
+
 ### 本地验证
 
 1. 启动 running-bot HTTP Gateway（端口 18765）。
 2. `python main.py`，在群「跑团机器人测试」发：文字、@机器人、图片、引用。
 3. 在其他群/私聊发消息，应**不**出现 `push_status=success`（未命中白名单）。
 4. 查看 running-bot ingress 是否收到 JSON（无需验证 Outbox）。
+5. 联调自测（无需微信在线，**默认跳过 AI 用例**）：`python scripts/integration_test_ingress.py --bot-name 跑团小助手`
+6. 导出对账证据：`python scripts/export_ingress_evidence.py`
+
+### P0：管理员「引用 + @ + /撤销」
+
+管理员引用机器人「已记录…打卡ID…」并 `@跑团小助手 /撤销` 时，ingress payload **必须**包含：
+
+| 字段 | 要求 |
+|------|------|
+| `message.text` / `raw_text` | 含 `@跑团小助手` 与 `/撤销` |
+| `message.is_at_bot` 或 `message.mentions[]` | 至少一种 |
+| `message.quote.text` | 被引用**全文**（含「已记录」与 `打卡ID`），不可仅「引用文字」占位 |
+| `sender.display_name` | 管理员真实昵称 |
+
+验收：HTTP 200 且 `action_metadata.action_type=admin_quote_undo`，群内为短句撤销文案，**不应**出现 AI 段子。
+
+自检：`python scripts/integration_test_ingress.py --bot-name 跑团小助手`（不含 AI 用例）。
 
 ### 已知限制
 
-- `message.mentions` 暂未解析，固定 `[]`
-- `message.is_at_bot` 仅文本 `@昵称` 匹配
-- `quote.message_id` 常为空
+- 引用图片仅靠识图补卡（「/补卡」无距离）需 `quote.media.inline_base64`；HEVC 引用图暂不支持
 - 无 `local_id` 时 `message.id` 可能因秒级时间戳碰撞而不稳
 - `images.url` 不提供；V2 图片解密失败时 `push_status=partial`
 
