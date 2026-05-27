@@ -314,22 +314,22 @@ def resolve_username(chat_name):
     return None
 
 
-_zstd_dctx = zstd.ZstdDecompressor()
+from running_bot_push import decode_wcdb_text
 
 
 def _decompress_content(content, ct):
     """解压 zstd 压缩的消息内容"""
-    if ct and ct == 4 and isinstance(content, bytes):
-        try:
-            return _zstd_dctx.decompress(content).decode('utf-8', errors='replace')
-        except Exception:
-            return None
-    if isinstance(content, bytes):
-        try:
-            return content.decode('utf-8', errors='replace')
-        except Exception:
-            return None
-    return content
+    text = decode_wcdb_text(content, ct or 0)
+    return text if text else None
+
+
+def _session_table_has_summary_ct(conn) -> bool:
+    cols = {row[1] for row in conn.execute('PRAGMA table_info(SessionTable)')}
+    return 'WCDB_CT_summary' in cols
+
+
+def _decode_session_summary(summary, summary_ct=0) -> str:
+    return decode_wcdb_text(summary, summary_ct or 0)
 
 
 def _parse_message_content(content, local_type, is_group):
@@ -618,27 +618,38 @@ def get_recent_sessions(limit: int = 20) -> str:
 
     names = get_contact_names()
     conn = sqlite3.connect(path)
-    rows = conn.execute("""
-        SELECT username, unread_count, summary, last_timestamp,
-               last_msg_type, last_msg_sender, last_sender_display_name
-        FROM SessionTable
-        WHERE last_timestamp > 0
-        ORDER BY last_timestamp DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
+    has_summary_ct = _session_table_has_summary_ct(conn)
+    if has_summary_ct:
+        sql = """
+            SELECT username, unread_count, summary, WCDB_CT_summary, last_timestamp,
+                   last_msg_type, last_msg_sender, last_sender_display_name
+            FROM SessionTable
+            WHERE last_timestamp > 0
+            ORDER BY last_timestamp DESC
+            LIMIT ?
+        """
+    else:
+        sql = """
+            SELECT username, unread_count, summary, last_timestamp,
+                   last_msg_type, last_msg_sender, last_sender_display_name
+            FROM SessionTable
+            WHERE last_timestamp > 0
+            ORDER BY last_timestamp DESC
+            LIMIT ?
+        """
+    rows = conn.execute(sql, (limit,)).fetchall()
     conn.close()
 
     results = []
     for r in rows:
-        username, unread, summary, ts, msg_type, sender, sender_name = r
+        if has_summary_ct:
+            username, unread, summary_raw, summary_ct, ts, msg_type, sender, sender_name = r
+        else:
+            username, unread, summary_raw, ts, msg_type, sender, sender_name = r
+            summary_ct = 0
+        summary = _decode_session_summary(summary_raw, summary_ct)
         display = names.get(username, username)
         is_group = '@chatroom' in username
-
-        if isinstance(summary, bytes):
-            try:
-                summary = _zstd_dctx.decompress(summary).decode('utf-8', errors='replace')
-            except Exception:
-                summary = '(压缩内容)'
         if isinstance(summary, str) and ':\n' in summary:
             summary = summary.split(':\n', 1)[1]
 
@@ -871,21 +882,40 @@ def get_new_messages() -> str:
 
     names = get_contact_names()
     conn = sqlite3.connect(path)
-    rows = conn.execute("""
-        SELECT username, unread_count, summary, last_timestamp,
-               last_msg_type, last_msg_sender, last_sender_display_name
-        FROM SessionTable
-        WHERE last_timestamp > 0
-        ORDER BY last_timestamp DESC
-    """).fetchall()
+    has_summary_ct = _session_table_has_summary_ct(conn)
+    if has_summary_ct:
+        sql = """
+            SELECT username, unread_count, summary, WCDB_CT_summary, last_timestamp,
+                   last_msg_type, last_msg_sender, last_sender_display_name
+            FROM SessionTable
+            WHERE last_timestamp > 0
+            ORDER BY last_timestamp DESC
+        """
+    else:
+        sql = """
+            SELECT username, unread_count, summary, last_timestamp,
+                   last_msg_type, last_msg_sender, last_sender_display_name
+            FROM SessionTable
+            WHERE last_timestamp > 0
+            ORDER BY last_timestamp DESC
+        """
+    rows = conn.execute(sql).fetchall()
     conn.close()
 
     curr_state = {}
     for r in rows:
-        username, unread, summary, ts, msg_type, sender, sender_name = r
+        if has_summary_ct:
+            username, unread, summary_raw, summary_ct, ts, msg_type, sender, sender_name = r
+        else:
+            username, unread, summary_raw, ts, msg_type, sender, sender_name = r
+            summary_ct = 0
         curr_state[username] = {
-            'unread': unread, 'summary': summary, 'timestamp': ts,
-            'msg_type': msg_type, 'sender': sender or '', 'sender_name': sender_name or '',
+            'unread': unread,
+            'summary': _decode_session_summary(summary_raw, summary_ct),
+            'timestamp': ts,
+            'msg_type': msg_type,
+            'sender': sender or '',
+            'sender_name': sender_name or '',
         }
 
     if not _last_check_state:
@@ -897,11 +927,6 @@ def get_new_messages() -> str:
                 display = names.get(username, username)
                 is_group = '@chatroom' in username
                 summary = s['summary']
-                if isinstance(summary, bytes):
-                    try:
-                        summary = _zstd_dctx.decompress(summary).decode('utf-8', errors='replace')
-                    except Exception:
-                        summary = '(压缩内容)'
                 if isinstance(summary, str) and ':\n' in summary:
                     summary = summary.split(':\n', 1)[1]
                 time_str = datetime.fromtimestamp(s['timestamp']).strftime('%H:%M')
@@ -920,11 +945,6 @@ def get_new_messages() -> str:
             display = names.get(username, username)
             is_group = '@chatroom' in username
             summary = s['summary']
-            if isinstance(summary, bytes):
-                try:
-                    summary = _zstd_dctx.decompress(summary).decode('utf-8', errors='replace')
-                except Exception:
-                    summary = '(压缩内容)'
             if isinstance(summary, str) and ':\n' in summary:
                 summary = summary.split(':\n', 1)[1]
 

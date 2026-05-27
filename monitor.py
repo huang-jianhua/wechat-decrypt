@@ -8,10 +8,12 @@ import hashlib, struct, os, sys, json, time, sqlite3, io
 import hmac as hmac_mod
 from datetime import datetime
 from Crypto.Cipher import AES
-import zstandard as zstd
+try:
+    import zstandard as zstd  # type: ignore[reportMissingImports]
+except ImportError:
+    zstd = None
+from running_bot_push import decode_wcdb_text
 from key_utils import get_key_info, strip_key_metadata
-
-_zstd_dctx = zstd.ZstdDecompressor()
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
@@ -114,20 +116,37 @@ def get_session_state(conn):
     """获取当前session状态"""
     state = {}
     try:
-        rows = conn.execute("""
-            SELECT username, unread_count, summary, last_timestamp,
-                   last_msg_type, last_msg_sender, last_sender_display_name
-            FROM SessionTable
-            WHERE last_timestamp > 0
-        """).fetchall()
+        cols = {row[1] for row in conn.execute('PRAGMA table_info(SessionTable)')}
+        has_summary_ct = 'WCDB_CT_summary' in cols
+        if has_summary_ct:
+            sql = """
+                SELECT username, unread_count, summary, WCDB_CT_summary, last_timestamp,
+                       last_msg_type, last_msg_sender, last_sender_display_name
+                FROM SessionTable
+                WHERE last_timestamp > 0
+            """
+        else:
+            sql = """
+                SELECT username, unread_count, summary, last_timestamp,
+                       last_msg_type, last_msg_sender, last_sender_display_name
+                FROM SessionTable
+                WHERE last_timestamp > 0
+            """
+        rows = conn.execute(sql).fetchall()
         for r in rows:
+            if has_summary_ct:
+                summary_raw, summary_ct = r[2], r[3] or 0
+                rest = r[4:]
+            else:
+                summary_raw, summary_ct = r[2], 0
+                rest = r[3:]
             state[r[0]] = {
                 'unread': r[1],
-                'summary': r[2] or '',
-                'timestamp': r[3],
-                'msg_type': r[4],
-                'sender': r[5] or '',
-                'sender_name': r[6] or '',
+                'summary': decode_wcdb_text(summary_raw, summary_ct),
+                'timestamp': rest[0],
+                'msg_type': rest[1],
+                'sender': rest[2] or '',
+                'sender_name': rest[3] or '',
             }
     except Exception as e:
         print(f"[ERROR] 读取session失败: {e}")
@@ -222,11 +241,6 @@ def main():
 
                     # 消息内容
                     summary = curr['summary']
-                    if isinstance(summary, bytes):
-                        try:
-                            summary = _zstd_dctx.decompress(summary).decode('utf-8', errors='replace')
-                        except Exception:
-                            summary = '(压缩内容)'
                     if summary:
                         # 群消息格式: "wxid_xxx:\n内容" - 提取内容部分
                         if ':\n' in summary:

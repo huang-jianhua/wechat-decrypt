@@ -536,6 +536,17 @@ class RunningBotReliableTests(unittest.TestCase):
             pusher.try_push(MagicMock(), msg_data)
             mock_push.assert_not_called()
 
+    def test_decode_wcdb_text_plain_utf8_bytes(self):
+        from running_bot_push import decode_wcdb_text
+        text = 'hjhua_java:\n@跑团小助手 /补卡'
+        self.assertEqual(decode_wcdb_text(text.encode('utf-8'), 0), text)
+
+    def test_decode_wcdb_text_respects_ct_flag(self):
+        from running_bot_push import decode_wcdb_text, _WCDB_ZSTD_MAGIC
+        plain = b'not zstd payload'
+        self.assertEqual(decode_wcdb_text(plain, 0), 'not zstd payload')
+        self.assertEqual(decode_wcdb_text(plain, 4), 'not zstd payload')
+
     def test_config_keeps_ascii_image_aes_key(self):
         cfg = RunningBotPushConfig.from_cfg({'image_aes_key': '5668554677fa978e'})
         self.assertEqual(cfg.image_aes_key, '5668554677fa978e')

@@ -895,15 +895,29 @@ def build_ingress_payload(
     }
 
 
+_WCDB_ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
+
+
+def decode_wcdb_text(data, ct_flag: int = 0) -> str:
+    """解码 WCDB 文本字段：ct_flag==4 或 zstd 魔数时解压，否则按 UTF-8。"""
+    if data is None:
+        return ''
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, bytes):
+        return str(data)
+    if _zstd_dctx:
+        use_zstd = int(ct_flag or 0) == 4 or data.startswith(_WCDB_ZSTD_MAGIC)
+        if use_zstd:
+            try:
+                return _zstd_dctx.decompress(data).decode('utf-8', errors='replace')
+            except Exception:
+                pass
+    return data.decode('utf-8', errors='replace')
+
+
 def decode_message_content(message_content, ct_flag) -> str:
-    if isinstance(message_content, bytes) and ct_flag == 4 and _zstd_dctx:
-        try:
-            return _zstd_dctx.decompress(message_content).decode('utf-8', errors='replace')
-        except Exception:
-            return message_content.decode('utf-8', errors='replace')
-    if isinstance(message_content, bytes):
-        return message_content.decode('utf-8', errors='replace')
-    return message_content or ''
+    return decode_wcdb_text(message_content, ct_flag)
 
 
 def build_msg_data_from_db_row(

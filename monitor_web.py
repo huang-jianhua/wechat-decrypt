@@ -41,6 +41,7 @@ from running_bot_push import (
     should_defer_push,
     should_push,
     parse_appmsg_rich,
+    decode_wcdb_text,
     _base_msg_type,
     _build_images,
     _quote_is_image,
@@ -1661,15 +1662,35 @@ class SessionMonitor:
     def query_state(self):
         """查询已解密副本的session状态"""
         conn = sqlite3.connect(f"file:{DECRYPTED_SESSION}?mode=ro", uri=True)
+        cols = {row[1] for row in conn.execute('PRAGMA table_info(SessionTable)')}
+        has_summary_ct = 'WCDB_CT_summary' in cols
+        if has_summary_ct:
+            sql = """
+                SELECT username, unread_count, summary, WCDB_CT_summary, last_timestamp,
+                       last_msg_type, last_msg_sender, last_sender_display_name
+                FROM SessionTable WHERE last_timestamp > 0
+            """
+        else:
+            sql = """
+                SELECT username, unread_count, summary, last_timestamp,
+                       last_msg_type, last_msg_sender, last_sender_display_name
+                FROM SessionTable WHERE last_timestamp > 0
+            """
         state = {}
-        for r in conn.execute("""
-            SELECT username, unread_count, summary, last_timestamp,
-                   last_msg_type, last_msg_sender, last_sender_display_name
-            FROM SessionTable WHERE last_timestamp > 0
-        """).fetchall():
+        for r in conn.execute(sql).fetchall():
+            if has_summary_ct:
+                summary_raw, summary_ct = r[2], r[3] or 0
+                rest = r[4:]
+            else:
+                summary_raw, summary_ct = r[2], 0
+                rest = r[3:]
             state[r[0]] = {
-                'unread': r[1], 'summary': r[2] or '', 'timestamp': r[3],
-                'msg_type': r[4], 'sender': r[5] or '', 'sender_name': r[6] or '',
+                'unread': r[1],
+                'summary': decode_wcdb_text(summary_raw, summary_ct),
+                'timestamp': rest[0],
+                'msg_type': rest[1],
+                'sender': rest[2] or '',
+                'sender_name': rest[3] or '',
             }
         conn.close()
         return state
@@ -1718,11 +1739,6 @@ class SessionMonitor:
                     sender = self.contact_names.get(curr['sender'], curr['sender_name'] or curr['sender'])
 
                 summary = curr['summary']
-                if isinstance(summary, bytes) and _zstd_dctx:
-                    try:
-                        summary = _zstd_dctx.decompress(summary).decode('utf-8', errors='replace')
-                    except Exception:
-                        summary = '(压缩内容)'
                 if summary and ':\n' in summary:
                     summary = summary.split(':\n', 1)[1]
 
