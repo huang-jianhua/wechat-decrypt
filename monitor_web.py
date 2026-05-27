@@ -735,9 +735,8 @@ class RunningBotReliableScanner:
                         resource_db_path=resource_db_path,
                         log_miss=True,
                     )
-                    if not img_name:
-                        continue
-                    msg_data['_quote_image_local_name'] = img_name
+                    if img_name:
+                        msg_data['_quote_image_local_name'] = img_name
                 if base == 3:
                     img_name = self._resolve_image_by_local_id(username, db_key, local_id, create_time)
                     if img_name is None:

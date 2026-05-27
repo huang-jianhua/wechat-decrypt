@@ -585,7 +585,7 @@ class RunningBotReliableTests(unittest.TestCase):
             )
             self.assertEqual(img, f'{file_md5}.jpg')
 
-    def test_defer_quote_image_without_inline_media(self):
+    def test_quote_image_command_pushes_without_inline_media(self):
         cfg = RunningBotPushConfig(
             bot_name='跑团小助手',
             group_whitelist=['跑团机器人测试'],
@@ -617,8 +617,14 @@ class RunningBotReliableTests(unittest.TestCase):
         }
         pusher = RunningBotPusher(cfg, contact_names)
         with patch('running_bot_push.push_with_retry') as mock_push:
+            mock_push.return_value = ('success', 200, '', 0, {'accepted': True})
             pusher.try_push(MagicMock(), msg_data)
-            mock_push.assert_not_called()
+            mock_push.assert_called_once()
+            payload = mock_push.call_args[0][0]
+            quote = payload['message']['quote']
+            self.assertEqual(quote['type'], 'image')
+            self.assertNotIn('media', quote or {})
+            self.assertIn('/补卡', payload['message']['text'])
 
 
 if __name__ == "__main__":

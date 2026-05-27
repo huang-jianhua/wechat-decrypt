@@ -73,7 +73,7 @@ class RunningBotPushConfig:
     outbox_db: str = ''
     outbox_batch_size: int = 20
     outbox_max_attempts: int = 3
-    log_post_payload: bool = True
+    log_post_payload: bool = False
     image_aes_key: bytes | str | None = None
     image_xor_key: int = 0x88
 
@@ -113,7 +113,7 @@ class RunningBotPushConfig:
             outbox_db=str(cfg.get('running_bot_outbox_db') or ''),
             outbox_batch_size=int(cfg.get('running_bot_outbox_batch_size', 20)),
             outbox_max_attempts=int(cfg.get('running_bot_outbox_max_attempts', 3)),
-            log_post_payload=bool(cfg.get('running_bot_log_post_payload', True)),
+            log_post_payload=bool(cfg.get('running_bot_log_post_payload', False)),
             image_aes_key=aes_key,
             image_xor_key=xor_key,
         )
@@ -729,9 +729,19 @@ def quote_has_inline_media(quote: dict | None) -> bool:
     return bool(media.get('content_base64'))
 
 
-def should_defer_quote_image_push(payload: dict) -> bool:
+def _log_quote_image_without_media(payload: dict, *, local_id=None) -> None:
+    """引用图命令仍推送；仅记录 quote.media 缺失便于对账。"""
     quote = (payload.get('message') or {}).get('quote')
-    return not quote_has_inline_media(quote)
+    if not quote or quote.get('type') != 'image' or quote_has_inline_media(quote):
+        return
+    image_id = (quote.get('image_id') or '')[:24]
+    msg_id = (quote.get('message_id') or '')[:24]
+    lid = f' local_id={local_id}' if local_id is not None else ''
+    print(
+        f'  [running-bot-push] 引用图无 inline_base64，仍推送命令'
+        f'{lid} image_id={image_id} ref_msgid={msg_id}',
+        flush=True,
+    )
 
 
 def _build_quote(
@@ -1494,16 +1504,9 @@ class RunningBotPusher:
             and not msg_data.get('_allow_empty_image')
         ):
             return
-        if self.config.reliable_mode and should_defer_quote_image_push(payload):
-            rich = msg_data.get('rich') or msg_data.get('rich_content')
-            file_md5 = _extract_quote_image_md5(rich) if rich else None
-            md5_hint = (file_md5 or '')[:12]
-            print(
-                f'  [running-bot-push] 引用图 inline 未就绪，推迟推送 '
-                f'local_id={msg_data.get("local_id")} md5={md5_hint}',
-                flush=True,
-            )
-            return
+        _log_quote_image_without_media(
+            payload, local_id=msg_data.get('local_id'),
+        )
         dedupe_key = payload['delivery']['dedupe_key']
         if self.outbox:
             status = self.outbox.enqueue(payload)

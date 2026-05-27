@@ -192,7 +192,7 @@ Content-Type: application/json
 | `running_bot_user_whitelist` | 私聊白名单（昵称/wxid 模糊匹配） | `[]` |
 | `running_bot_name` | 机器人昵称（用于识别 @） | `""` |
 | `running_bot_aliases` | 机器人别名列表 | `[]` |
-| `running_bot_log_post_payload` | POST 时打印请求/响应 JSON（图片 base64 脱敏） | `true` |
+| `running_bot_log_post_payload` | 联调时打印 POST 请求/响应 JSON（图片 base64 脱敏） | `false` |
 
 本阶段默认**仅推送群「跑团机器人测试」**；私聊需往 `running_bot_user_whitelist` 添加联系人。
 
@@ -252,7 +252,8 @@ Content-Type: application/json
 
 ### 已知限制
 
-- 引用图片仅靠识图补卡（「/补卡」无距离）需 `quote.media.inline_base64`；HEVC 引用图暂不支持
+- 引用图 `/补卡`：命令会立即推送；`quote.media.inline_base64` 能解析则附带，缺失时 Running 可能无法识图补卡（HEVC 引用图暂不支持 inline）
+- 主图 (type=image) 无 `images[].media` 时仍会推迟推送，直到本地 `.dat` 解密成功
 - 无 `local_id` 时 `message.id` 可能因秒级时间戳碰撞而不稳
 - `images.url` 不提供；V2 图片解密失败时 `push_status=partial`
 
