@@ -11,7 +11,6 @@ from datetime import datetime
 import xml.etree.ElementTree as ET
 from Crypto.Cipher import AES
 from mcp.server.fastmcp import FastMCP
-import zstandard as zstd
 from decode_image import ImageResolver
 from key_utils import get_key_info, key_path_variants, strip_key_metadata
 
