@@ -7,7 +7,7 @@
 | 版本 | **wechat_ingress_v1** |
 | 正式入口 | **`POST /api/ingress/wechat/message`** |
 | 受众 | WeChat Decryptor 项目 / Decryptor AI 助手 |
-| Running Service 实现 | 仓库内参考 `wechat_ingress_adapter.py`；Running 部署路径 `message_bus/wechat_ingress_adapter.py`、`message_bus/gateway.py` |
+| Running Service 实现 | `message_bus/wechat_ingress_adapter.py`、`message_bus/gateway.py` |
 | 关联文档 | `project-docs/14_HTTP_INGRESS_INTERFACE_SPEC.md`、`project-docs/15_MEDIA_INLINE_BASE64_PLAN.md` |
 | 本地验证 | `reports/verification/phase4_media_inline_base64_2026-05-25-local.md` |
 
@@ -139,20 +139,44 @@ Decryptor 联调前，Running Service 负责人需确认以下配置（`config.p
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `id` | string | 是 | 微信消息 ID |
-| `type` | string | 是 | `text` / `image` / `mixed` / `system` |
-| `text` | string | 否 | 清洗后正文 |
-| `raw_text` | string | 否 | 原始正文；`text` 为空时 Running Service 会回退用它 |
+| `type` | string | 是 | 传输层：`text` / `image` / `mixed` / `system`（见下） |
+| `content_kind` | string | **强烈建议** | 语义层：`text` / `image` / `quote` / `link` / `channels` / `voice` / `video` / `file` / `miniapp` / `emoji` / `chatlog` / `voip` |
+| `wx_base_type` | number | 否 | 微信原始类型：1 文本、3 图片、34 语音、43 视频、47 表情、49 appmsg、50 通话 |
+| `wx_app_type` | number | 否 | 仅当 `wx_base_type=49`：5 链接、6 文件、19 合并转发、33/36 小程序、**51 视频号**、57 引用 |
+| `text` | string | 否 | **人类可读**清洗后正文；**禁止**把 appmsg / 视频号原始 XML 塞进此字段 |
+| `raw_text` | string | 否 | 原始正文；`text` 为空时 Running Service 会回退用它（仍须遵守上条） |
 | `mentions` | array | 否 | 被 @ 的昵称或 ID 列表 |
 | `is_at_bot` | boolean | 否 | 是否明确 @ 机器人 |
 | `images` | array | 否 | 图片列表；见 §6 |
 | `quote` | object/null | 否 | 引用消息；见 §7 |
 
-`type` 映射规则：
+#### 三层类型说明
+
+1. **`wx_base_type`**：微信底层消息类型（Decryptor 从 DB 读出）。
+2. **`wx_app_type`**：仅 `wx_base_type=49`（appmsg）时的子类型。
+3. **`content_kind`**：跑团业务语义；Running Service **优先按此字段决定是否处理**。
+
+`message.type`（传输层）映射规则：
 
 - `text` → 文本消息
 - `image` → 图片消息
 - `mixed` → 有图按图片处理，无图按文本
-- 其他未知类型 → 按文本兜底
+- Running 在 adapter 内根据 `content_kind` 可能改为内部 `system`（仅表示「已接收但不跑业务」）
+
+#### `content_kind` 与跑团行为
+
+| content_kind | Decryptor `text` 要求 | Running Service |
+| --- | --- | --- |
+| `text` | 可读正文（打卡、排行榜、确认等） | 走路由 + 文本业务 |
+| `image` | 可为空或 `[图片]` | 落盘 + image_job |
+| `quote` | 命令正文 + 完整 `quote`；须 `is_at_bot` 或 `mentions[]` | 管理员 `/撤销` `/补卡` 等 |
+| `link` / `channels` / `voice` / `video` / `file` / `miniapp` / `emoji` / `chatlog` / `voip` | 短摘要即可，勿投 XML | **ignore**（`accepted` 但不执行业务） |
+
+**不推送**：`wx_base_type` 为 `10000`（系统）、`10002`（撤回）。
+
+未带 `content_kind` 时，Running 会用 `wx_*_type` 或正文启发式推断；若正文含 `<?xml` / `<finderFeed` 等，按 **ignore** 处理，避免视频号 XML 误触发打卡。
+
+实现：`message_bus/ingress_content_kind.py`、`message_bus/wechat_ingress_adapter.py`。
 
 ### 4.5 `delivery`
 
@@ -435,7 +459,7 @@ Gateway 解码 base64 → 落盘 media_store → 生成 media_ref
 }
 ```
 
-引用图片（跨机 `/补卡` 无距离识图）应带 `quote.media`：
+引用图片（跨机 Decryptor **推荐** inline base64；同机调试可用 `local_path`）：
 
 ```json
 "quote": {
@@ -443,19 +467,23 @@ Gateway 解码 base64 → 落盘 media_store → 生成 media_ref
   "sender_name": "张三",
   "text": "",
   "type": "image",
-  "image_id": "wx_img_<md5>",
+  "image_id": "wx_img_quote",
   "media": {
     "transport": "inline_base64",
-    "content_base64": "<BASE64_WITHOUT_PREFIX>",
+    "content_base64": "<base64>",
     "mime_type": "image/jpeg",
-    "file_name": "<md5>.jpg",
-    "size_bytes": 245678,
-    "sha256": "a1b2c3..."
+    "size_bytes": 9251,
+    "sha256": "<hex>"
   }
 }
 ```
 
-Decryptor 从引用 XML 的 `refermsg/content` 提取图片 MD5，解密 `.dat` 后填入 `quote.media`（与主图相同结构）。Running Service 侧需开启对应验收路径。
+| `/补卡` 形态 | `quote` 要求 | Running 行为 |
+| --- | --- | --- |
+| `/补卡 5.2公里` + 引用图 | `quote.sender_name` 必填；`quote.media` 可选 | 用发送者名 + 命令距离补记，不强制识图 |
+| `/补卡` 无距离 + 引用图 | **必须** `quote.media.inline_base64`（或同机 `local_path`） | 识图补卡 `admin_quote_image_makeup` |
+
+验证报告：`reports/verification/decryptor_http_ingress_admin_2026-05-27-real-group.md`。状态：**已实现 / 已真实微信群验证（跑团机器人测试）**。
 
 ---
 
@@ -514,13 +542,14 @@ HTTP 200 + duplicate=true → 视为成功，停止重试
 
 ## 10. 消息类型与业务覆盖
 
-| 场景 | message.type | 关键字段 | Running Service 行为 |
+| 场景 | content_kind | 关键字段 | Running Service 行为 |
 | --- | --- | --- | --- |
 | 文字打卡 | `text` | `text` 含「打卡 Xkm」 | 执行业务 + Outbox 回复 |
 | 我的跑量 / 排行榜 | `text` | 对应关键词 | 执行业务 + Outbox 回复 |
-| 管理员命令 | `text` | `is_at_bot=true` + 命令文本 | 执行业务 + Outbox 回复 |
+| 管理员引用撤销/补卡 | `quote` | `is_at_bot=true` + `quote.type` text/image | 执行业务 + Outbox 回复 |
 | 跑步截图 | `image` | `images[].media.inline_base64` | 落盘 + 创建 image_job + 异步识别 |
-| @ 机器人闲聊 | `text` | `is_at_bot=true`，未命中跑团功能 | **当前 HTTP 路径未完整执行 AI 入队** |
+| @ 机器人闲聊 | `text` | `is_at_bot=true`，未命中跑团功能 | HTTP 路径可执行 AI 回复并写 Outbox（管理员 `/撤销` `/补卡` 强制走业务，不进 AI） |
+| 视频号 / 链接 / 语音 / 文件 / 小程序 / 表情 | `channels` 等 | **勿**把原始 XML 当 `text` | **ignore**（不误打卡） |
 | 机器人自己消息 | 任意 | `sender.is_self=true` | 忽略 |
 
 ---
@@ -533,7 +562,9 @@ HTTP 200 + duplicate=true → 视为成功，停止重试
 - [ ] 每条消息有唯一 `event_id`、`trace_id`、`delivery.dedupe_key`
 - [ ] `chat.name` 与 Running Service 配置的群名完全一致
 - [ ] `sender.display_name` 稳定传递成员展示名
-- [ ] 文本消息填 `message.text` 或 `message.raw_text`
+- [ ] 文本消息填 `message.text` 或 `message.raw_text`（人类可读，非 appmsg XML）
+- [ ] 视频号/链接/卡片填 `content_kind=channels|link|...`，勿用 `type=text`+XML
+- [ ] 尽量同时传 `content_kind`、`wx_base_type`、`wx_app_type`（51=视频号）
 - [ ] 图片用 `media.transport=inline_base64`，并正确计算 `size_bytes` + `sha256`
 - [ ] base64 **无** `data:` 前缀；日志里**不**打印完整 base64
 - [ ] 引用消息填 `message.quote.text` / `sender_name` / `message_id`

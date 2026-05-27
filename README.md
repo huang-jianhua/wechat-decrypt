@@ -205,6 +205,10 @@ Content-Type: application/json
 | `chat.type` | 群 `group` / 私聊 `private` |
 | `sender.id` | 群：发送者 wxid；私聊：对方 wxid |
 | `message.id` | `username:timestamp:local_id` 或 hash 回退 |
+| `message.type` | 传输层：`text` / `image`（跑团业务用） |
+| `message.content_kind` | 语义层：`text` / `image` / `quote` / `channels` / `link` / …（Running 按此 ignore 或执行业务） |
+| `message.wx_base_type` | 微信底层类型：1 文本、3 图片、49 appmsg、51 在 app 子类型里 |
+| `message.wx_app_type` | 仅 `wx_base_type=49`：5 链接、6 文件、51 视频号、57 引用 |
 | `event_id` / `trace_id` / `delivery.dedupe_key` | 稳定唯一；重试时三者不变（`trace_id` 默认等于 `event_id`） |
 | `message.images[]` | `media.transport=inline_base64` + `mime_type` / `size_bytes` / `sha256` / `content_base64` |
 | `message.mentions` / `message.is_at_bot` | @ 机器人路径必填（见 API 文档 §7） |

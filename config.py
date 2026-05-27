@@ -45,7 +45,7 @@ _DEFAULT = {
     "running_bot_outbox_db": "decrypted/_monitor_cache/running_bot_outbox.db",
     "running_bot_outbox_batch_size": 20,
     "running_bot_outbox_max_attempts": 3,
-    "running_bot_log_post_payload": False,
+    "running_bot_log_post_payload": True,
 }
 
 

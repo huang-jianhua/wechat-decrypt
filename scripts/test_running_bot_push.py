@@ -385,6 +385,45 @@ class RunningBotReliableTests(unittest.TestCase):
         self.assertEqual(len(msg['mentions']), 1)
         self.assertTrue(msg['mentions'][0]['is_bot'])
 
+    def test_build_payload_from_finder_feed_not_raw_xml(self):
+        cfg = RunningBotPushConfig(bot_name='跑团小助手', group_whitelist=['跑团机器人测试'])
+        contact_names = {'test@chatroom': '跑团机器人测试', 'wxid_admin': '筋膜球'}
+        xml = '''hjhua_java:
+<?xml version="1.0"?>
+<msg>
+\t<appmsg appid="" sdkver="0">
+\t\t<title>当前版本不支持展示该内容，请升级至最新版本。</title>
+\t\t<type>51</type>
+\t\t<url>https://support.weixin.qq.com/security/readtemplate?t=w_security_center_website/upgrade</url>
+\t\t<finderFeed>
+\t\t\t<nickname>中国之声</nickname>
+\t\t\t<desc>一根绑在腰间的绳子，将一对父子紧紧连在一起。</desc>
+\t\t</finderFeed>
+\t</appmsg>
+</msg>'''
+        msg_data = build_msg_data_from_db_row(
+            username='test@chatroom',
+            chat_display='跑团机器人测试',
+            db_key='message/message_0.db',
+            local_id=1317,
+            local_type=49,
+            create_time=999,
+            real_sender_id=1,
+            message_content=xml,
+            ct_flag=0,
+            name2id={1: 'wxid_admin'},
+            contact_names=contact_names,
+        )
+        payload = build_ingress_payload(msg_data, cfg, contact_names)
+        msg = payload['message']
+        self.assertEqual(msg['type'], 'text')
+        self.assertEqual(msg['content_kind'], 'channels')
+        self.assertEqual(msg['wx_base_type'], 49)
+        self.assertEqual(msg['wx_app_type'], 51)
+        self.assertNotIn('<?xml', msg['text'])
+        self.assertIn('[视频号] 中国之声', msg['text'])
+        self.assertIn('一根绑在腰间的绳子', msg['text'])
+
     def test_quote_empty_text_ref_type_1_is_not_image(self):
         rich = {
             'type': 'quote',

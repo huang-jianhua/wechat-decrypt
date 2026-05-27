@@ -271,9 +271,47 @@ def parse_appmsg_rich(content: str, local_type: int = 0) -> dict | None:
                 'title': title,
                 'file_ext': (attach.findtext('fileext') or '') if attach is not None else '',
                 'file_size': int(attach.findtext('totallen') or 0) if attach is not None else 0,
+                'app_type': app_type,
+            }
+        if app_type in (33, 36, 44):
+            source = (appmsg.findtext('sourcedisplayname') or '').strip()
+            return {
+                'type': 'miniapp',
+                'title': title,
+                'source': source,
+                'url': url,
+                'app_type': app_type,
+            }
+        if app_type == 19:
+            return {
+                'type': 'chatlog',
+                'title': title,
+                'des': des[:200] if des else '',
+                'app_type': app_type,
+            }
+        if app_type == 51:
+            finder = appmsg.find('.//finderFeed')
+            nickname = ''
+            finder_desc = ''
+            if finder is not None:
+                nickname = (finder.findtext('nickname') or '').strip()
+                finder_desc = (finder.findtext('desc') or '').strip()
+            return {
+                'type': 'channels',
+                'title': title,
+                'des': finder_desc or des[:200],
+                'url': url,
+                'finder_nickname': nickname,
+                'app_type': app_type,
             }
         if title or url:
-            return {'type': 'link', 'title': title, 'des': des[:200], 'url': url}
+            return {
+                'type': 'link',
+                'title': title,
+                'des': des[:200],
+                'url': url,
+                'app_type': app_type,
+            }
     except Exception:
         return None
     return None
@@ -344,6 +382,89 @@ def _ingress_message_type(base_type: int, rich: dict | None) -> str:
     if base_type == 3:
         return 'image'
     return 'text'
+
+
+def _extract_wx_types(msg_type_raw: int, rich: dict | None) -> tuple[int, int | None]:
+    base_type, sub_type = _split_msg_type(int(msg_type_raw or 0))
+    app_type = None
+    if rich and rich.get('app_type') is not None:
+        try:
+            app_type = int(rich['app_type'])
+        except (TypeError, ValueError):
+            app_type = None
+    elif base_type == 49 and sub_type:
+        app_type = sub_type
+    return base_type, app_type
+
+
+def _resolve_content_kind(base_type: int, rich: dict | None) -> str:
+    if rich:
+        rich_type = rich.get('type')
+        if rich_type in {
+            'quote', 'link', 'channels', 'miniapp', 'file', 'chatlog',
+            'emoji', 'voice', 'video', 'voip',
+        }:
+            return str(rich_type)
+    return {
+        1: 'text',
+        3: 'image',
+        34: 'voice',
+        42: 'text',
+        43: 'video',
+        47: 'emoji',
+        48: 'text',
+        49: 'link',
+        50: 'voip',
+    }.get(base_type, 'text')
+
+
+_RICH_TEXT_KINDS = frozenset({'link', 'file', 'channels', 'miniapp', 'chatlog'})
+
+
+def _format_rich_text(rich: dict) -> str:
+    """把 appmsg 解析结果转为可读正文（避免推送原始 XML）。"""
+    rich_type = rich.get('type')
+    if rich_type == 'channels':
+        nickname = (rich.get('finder_nickname') or '').strip()
+        desc = (rich.get('des') or '').strip()
+        if nickname and desc:
+            return _collapse_text(f'[视频号] {nickname}：{desc}')
+        if nickname:
+            return _collapse_text(f'[视频号] {nickname}')
+        title = (rich.get('title') or '').strip()
+        if '当前版本不支持展示该内容' in title and desc:
+            return _collapse_text(f'[视频号] {desc}')
+        return _collapse_text(title or desc or '[视频号]')
+    if rich_type == 'link':
+        desc = (rich.get('des') or '').strip()
+        title = (rich.get('title') or '').strip()
+        url = (rich.get('url') or '').strip()
+        if '当前版本不支持展示该内容' in title and desc:
+            title = ''
+        if title:
+            label = f'[链接] {title}'
+            return _collapse_text(label)
+        parts = [p for p in (desc, url) if p]
+        return _collapse_text('\n'.join(parts)) if parts else '[链接]'
+    if rich_type == 'miniapp':
+        title = (rich.get('title') or '').strip()
+        return _collapse_text(f'[小程序] {title}' if title else '[小程序]')
+    if rich_type == 'chatlog':
+        title = (rich.get('title') or '').strip()
+        return _collapse_text(f'[聊天记录] {title}' if title else '[聊天记录]')
+    if rich_type == 'file':
+        title = (rich.get('title') or '').strip()
+        ext = (rich.get('file_ext') or '').strip()
+        label = f'[文件] {title}' if title else '[文件]'
+        if ext and not label.endswith(f'.{ext}'):
+            label = f'{label}.{ext}'
+        return _collapse_text(label)
+    return ''
+
+
+def _looks_like_raw_xml(text: str) -> bool:
+    lowered = (text or '').lower()
+    return '<?xml' in lowered or '<appmsg' in lowered or '<finderfeed' in lowered
 
 
 def _extract_message_body(content: str, is_group: bool) -> str:
@@ -844,6 +965,19 @@ def build_ingress_payload(
         reply_text = rich.get('title') or text
         raw_text = reply_text
         text = _collapse_text(reply_text)
+    elif rich and rich.get('type') in _RICH_TEXT_KINDS:
+        rich_text = _format_rich_text(rich)
+        if rich_text:
+            raw_text = rich_text
+            text = _collapse_text(rich_text)
+    if _looks_like_raw_xml(text or raw_text):
+        fallback = _format_rich_text(rich) if rich else ''
+        if fallback:
+            raw_text = fallback
+            text = _collapse_text(fallback)
+        else:
+            raw_text = ''
+            text = ''
 
     local_id = msg_data.get('local_id')
     message_id = stable_message_id(
@@ -856,6 +990,8 @@ def build_ingress_payload(
     trace_id = msg_data.get('_push_trace_id') or stable_trace_id(event_id)
 
     base_type = _base_msg_type(msg_data.get('msg_type_raw', 0))
+    wx_base_type, wx_app_type = _extract_wx_types(msg_data.get('msg_type_raw', 0), rich)
+    content_kind = _resolve_content_kind(wx_base_type, rich)
     ingress_type = _ingress_message_type(base_type, rich)
     quote = _build_quote(
         rich,
@@ -890,6 +1026,9 @@ def build_ingress_payload(
         'message': {
             'id': message_id,
             'type': ingress_type,
+            'content_kind': content_kind,
+            'wx_base_type': wx_base_type,
+            **({'wx_app_type': wx_app_type} if wx_app_type is not None else {}),
             'text': text,
             'raw_text': raw_text or text,
             'mentions': mentions,
